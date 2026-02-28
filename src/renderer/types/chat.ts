@@ -1,4 +1,5 @@
 import type { ProviderId } from '@shared/providers/registry';
+import type { WorkflowState } from '@shared/workflow/types';
 import { type LinearIssueSummary } from './linear';
 import { type GitHubIssueSummary } from './github';
 import { type JiraIssueSummary } from './jira';
@@ -42,6 +43,7 @@ export interface TaskMetadata {
     }>;
     selectedAgent?: ProviderId | null;
   } | null;
+  workflow?: WorkflowState | null;
 }
 
 export interface Task {
