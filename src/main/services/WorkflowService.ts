@@ -10,11 +10,11 @@ import type {
   WorkflowTemplate,
 } from '@shared/workflow/types';
 
-const WORKFLOW_DIR_REL = '.emdash/workflow';
-const PLAN_REL_PATH = `${WORKFLOW_DIR_REL}/plan.md`;
+const WORKFLOW_ROOT_REL = '.zenflow';
 const CHAT_ID_COMMENT = /^\s*<!--\s*emdash:chat-id=(.*?)\s*-->\s*$/;
 const STEP_ID_COMMENT = /^\s*<!--\s*emdash:step-id=(.*?)\s*-->\s*$/;
 const PAUSE_COMMENT = /^\s*<!--\s*emdash:pause-point=(true|false)\s*-->\s*$/;
+const DEFAULT_SCOPE_KEY = 'default';
 
 function slugify(input: string): string {
   return input
@@ -37,6 +37,8 @@ type StepSeed = {
   artifacts: string[];
 };
 
+type WorkflowStorage = Record<string, WorkflowState>;
+
 function buildTemplateSteps(template: WorkflowTemplate): StepSeed[] {
   if (template === 'spec-and-build') {
     return [
@@ -44,7 +46,7 @@ function buildTemplateSteps(template: WorkflowTemplate): StepSeed[] {
         number: 1,
         title: 'Technical Spec',
         instructions:
-          'Analyze the feature and write a technical specification to .emdash/workflow/spec.md. Include architecture, affected files, risks, and rollout notes.',
+          'Analyze the feature and write a technical specification to spec.md. Include architecture, affected files, risks, and rollout notes.',
         pausePoint: true,
         artifacts: ['spec.md'],
       },
@@ -52,7 +54,7 @@ function buildTemplateSteps(template: WorkflowTemplate): StepSeed[] {
         number: 2,
         title: 'Implementation',
         instructions:
-          'Implement the feature based on spec.md. Summarize completed work and open items in .emdash/workflow/report.md.',
+          'Implement the feature based on spec.md. Summarize completed work and open items in report.md.',
         pausePoint: false,
         artifacts: ['report.md'],
       },
@@ -64,15 +66,14 @@ function buildTemplateSteps(template: WorkflowTemplate): StepSeed[] {
       number: 1,
       title: 'Requirements',
       instructions:
-        'Clarify and document requirements in .emdash/workflow/requirements.md. Capture assumptions and questions for user confirmation.',
+        'Clarify and document requirements in requirements.md. Capture assumptions and questions for user confirmation.',
       pausePoint: true,
       artifacts: ['requirements.md'],
     },
     {
       number: 2,
       title: 'Technical Spec',
-      instructions:
-        'Produce a technical specification in .emdash/workflow/spec.md using requirements.md as input.',
+      instructions: 'Produce a technical specification in spec.md using requirements.md as input.',
       pausePoint: false,
       artifacts: ['spec.md'],
     },
@@ -80,7 +81,7 @@ function buildTemplateSteps(template: WorkflowTemplate): StepSeed[] {
       number: 3,
       title: 'Planning',
       instructions:
-        'Expand .emdash/workflow/plan.md into concrete implementation steps. Keep each new step coherent and executable in a single focused chat.',
+        'Expand plan.md into concrete implementation steps. Keep each new step coherent and executable in a single focused chat.',
       pausePoint: true,
       artifacts: ['plan.md'],
     },
@@ -115,13 +116,64 @@ function buildStepId(number: number, title: string): string {
   return `step-${number}-${slugify(title || `step-${number}`) || `step-${number}`}`;
 }
 
+function isWorkflowState(value: unknown): value is WorkflowState {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<WorkflowState>;
+  return candidate.enabled === true && Array.isArray(candidate.steps);
+}
+
+function normalizeScopeKey(scopeKey?: string): string {
+  const input = typeof scopeKey === 'string' ? scopeKey.trim() : '';
+  const normalized = slugify(input || DEFAULT_SCOPE_KEY);
+  return normalized || DEFAULT_SCOPE_KEY;
+}
+
+function resolveWorkflowPaths(
+  taskId: string,
+  scopeKey: string
+): {
+  baseDirRelPath: string;
+  scopeDirRelPath: string;
+  planRelPath: string;
+} {
+  const taskSlug = slugify(taskId) || 'task';
+  const baseDirRelPath = path.posix.join(WORKFLOW_ROOT_REL, taskSlug);
+  const scopeDirRelPath =
+    scopeKey === DEFAULT_SCOPE_KEY
+      ? baseDirRelPath
+      : path.posix.join(baseDirRelPath, normalizeScopeKey(scopeKey));
+  const planRelPath = path.posix.join(scopeDirRelPath, 'plan.md');
+  return {
+    baseDirRelPath,
+    scopeDirRelPath,
+    planRelPath,
+  };
+}
+
 export class WorkflowService {
-  private getWorkflowFromTask(task: Task): WorkflowState | null {
-    const workflow = task.metadata?.workflow;
-    if (!workflow || typeof workflow !== 'object') return null;
-    if (workflow.enabled !== true) return null;
-    if (!Array.isArray(workflow.steps)) return null;
-    return workflow as WorkflowState;
+  private getWorkflowStorage(task: Task): WorkflowStorage {
+    const workflows = task.metadata?.workflows;
+    if (!workflows || typeof workflows !== 'object') return {};
+
+    const out: WorkflowStorage = {};
+    for (const [key, value] of Object.entries(workflows as Record<string, unknown>)) {
+      if (!isWorkflowState(value)) continue;
+      out[normalizeScopeKey(key)] = value;
+    }
+    return out;
+  }
+
+  private getWorkflowFromTask(task: Task, scopeKey?: string): WorkflowState | null {
+    const normalizedScope = normalizeScopeKey(scopeKey);
+    const workflows = this.getWorkflowStorage(task);
+    if (workflows[normalizedScope]) return workflows[normalizedScope];
+
+    // Backward compatibility for early workflow metadata shape.
+    if (normalizedScope === DEFAULT_SCOPE_KEY && isWorkflowState(task.metadata?.workflow)) {
+      return task.metadata.workflow as WorkflowState;
+    }
+
+    return null;
   }
 
   private async getTaskOrThrow(taskId: string): Promise<Task> {
@@ -132,30 +184,45 @@ export class WorkflowService {
     return task;
   }
 
-  private withWorkflowMetadata(task: Task, workflow: WorkflowState): Task {
+  private withWorkflowMetadata(task: Task, scopeKey: string, workflow: WorkflowState): Task {
+    const normalizedScope = normalizeScopeKey(scopeKey);
+    const existing = this.getWorkflowStorage(task);
+    const nextStorage: WorkflowStorage = {
+      ...existing,
+      [normalizedScope]: workflow,
+    };
+
+    const metadata = {
+      ...(task.metadata || {}),
+      workflows: nextStorage,
+      // Keep legacy field aligned for default scope.
+      ...(normalizedScope === DEFAULT_SCOPE_KEY ? { workflow } : {}),
+    };
+
     return {
       ...task,
-      metadata: {
-        ...(task.metadata || {}),
-        workflow,
-      },
+      metadata,
     };
   }
 
-  private async persistTaskWorkflow(task: Task, workflow: WorkflowState): Promise<WorkflowState> {
-    const nextTask = this.withWorkflowMetadata(task, workflow);
+  private async persistTaskWorkflow(
+    task: Task,
+    scopeKey: string,
+    workflow: WorkflowState
+  ): Promise<WorkflowState> {
+    const nextTask = this.withWorkflowMetadata(task, scopeKey, workflow);
     await databaseService.saveTask(nextTask);
     return workflow;
   }
 
-  private ensureWorkflowDir(taskPath: string): string {
-    const abs = path.join(taskPath, WORKFLOW_DIR_REL);
+  private ensureWorkflowDir(taskPath: string, workflow: WorkflowState): string {
+    const abs = path.join(taskPath, workflow.artifactsDirRelPath);
     fs.mkdirSync(abs, { recursive: true });
     return abs;
   }
 
-  private planAbsPath(taskPath: string): string {
-    return path.join(taskPath, PLAN_REL_PATH);
+  private planAbsPath(taskPath: string, workflow: WorkflowState): string {
+    return path.join(taskPath, workflow.planRelPath);
   }
 
   private renderPlanMarkdown(workflow: WorkflowState): string {
@@ -163,6 +230,7 @@ export class WorkflowService {
     lines.push('# Workflow Plan');
     lines.push('');
     lines.push(`Feature: ${workflow.featureDescription}`);
+    lines.push(`Scope: ${workflow.scopeKey}`);
     lines.push(`Template: ${workflow.type}`);
     lines.push(`Status: ${workflow.status}`);
     lines.push(`Auto Mode: ${workflow.autoMode}`);
@@ -182,7 +250,6 @@ export class WorkflowService {
     }
 
     lines.push('## Notes');
-    lines.push('- Edit step instructions in task metadata/UI, not directly in this file.');
     lines.push('- Chat IDs are persisted in the comment line below each step.');
     lines.push('');
 
@@ -190,8 +257,12 @@ export class WorkflowService {
   }
 
   private writePlanFile(taskPath: string, workflow: WorkflowState): void {
-    this.ensureWorkflowDir(taskPath);
-    fs.writeFileSync(this.planAbsPath(taskPath), this.renderPlanMarkdown(workflow), 'utf8');
+    this.ensureWorkflowDir(taskPath, workflow);
+    fs.writeFileSync(
+      this.planAbsPath(taskPath, workflow),
+      this.renderPlanMarkdown(workflow),
+      'utf8'
+    );
   }
 
   private parsePlanMarkdown(markdown: string, existing: WorkflowState): WorkflowState {
@@ -272,6 +343,21 @@ export class WorkflowService {
     };
   }
 
+  private workflowsEqual(a: WorkflowState, b: WorkflowState): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  private syncWorkflowFromPlan(taskPath: string, workflow: WorkflowState): WorkflowState {
+    const planPath = this.planAbsPath(taskPath, workflow);
+    if (!fs.existsSync(planPath)) {
+      this.writePlanFile(taskPath, workflow);
+      return workflow;
+    }
+
+    const markdown = fs.readFileSync(planPath, 'utf8');
+    return this.parsePlanMarkdown(markdown, workflow);
+  }
+
   private buildStepPrompt(workflow: WorkflowState, step: WorkflowStep): string {
     const artifactsDir = workflow.artifactsDirRelPath;
     const priorArtifacts = workflow.steps
@@ -312,10 +398,14 @@ export class WorkflowService {
     taskId: string;
     template: WorkflowTemplate;
     featureDescription: string;
+    scopeKey?: string;
   }): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(args.taskId);
+    const normalizedScope = normalizeScopeKey(args.scopeKey);
     const featureDescription = args.featureDescription?.trim() || task.name;
     const createdAt = nowIso();
+    const paths = resolveWorkflowPaths(task.id, normalizedScope);
+
     const steps: WorkflowStep[] = buildTemplateSteps(args.template).map((seed) => ({
       id: buildStepId(seed.number, seed.title),
       number: seed.number,
@@ -329,42 +419,59 @@ export class WorkflowService {
 
     const workflow: WorkflowState = {
       enabled: true,
+      scopeKey: normalizedScope,
       type: args.template,
       status: 'planning',
       autoMode: 'manual',
       featureDescription,
       currentStepId: null,
-      planRelPath: PLAN_REL_PATH,
-      artifactsDirRelPath: WORKFLOW_DIR_REL,
+      planRelPath: paths.planRelPath,
+      artifactsDirRelPath: paths.scopeDirRelPath,
       steps,
       createdAt,
       updatedAt: createdAt,
     };
 
-    await this.persistTaskWorkflow(task, workflow);
+    await this.persistTaskWorkflow(task, normalizedScope, workflow);
     this.writePlanFile(task.path, workflow);
     return workflow;
   }
 
-  async getWorkflow(taskId: string): Promise<WorkflowState | null> {
+  async getWorkflow(taskId: string, scopeKey?: string): Promise<WorkflowState | null> {
     const task = await this.getTaskOrThrow(taskId);
-    return this.getWorkflowFromTask(task);
-  }
+    const normalizedScope = normalizeScopeKey(scopeKey);
+    const workflow = this.getWorkflowFromTask(task, normalizedScope);
+    if (!workflow) return null;
 
-  async setAutoMode(args: { taskId: string; autoMode: WorkflowAutoMode }): Promise<WorkflowState> {
-    const task = await this.getTaskOrThrow(args.taskId);
-    const workflow = this.getWorkflowFromTask(task);
-    if (!workflow) {
-      throw new Error('Workflow is not initialized for this task');
+    const synced = this.syncWorkflowFromPlan(task.path, workflow);
+    if (!this.workflowsEqual(synced, workflow)) {
+      await this.persistTaskWorkflow(task, normalizedScope, synced);
+      return synced;
     }
 
+    return workflow;
+  }
+
+  async setAutoMode(args: {
+    taskId: string;
+    autoMode: WorkflowAutoMode;
+    scopeKey?: string;
+  }): Promise<WorkflowState> {
+    const task = await this.getTaskOrThrow(args.taskId);
+    const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const existing = this.getWorkflowFromTask(task, normalizedScope);
+    if (!existing) {
+      throw new Error('Workflow is not initialized for this task/scope');
+    }
+
+    const workflow = this.syncWorkflowFromPlan(task.path, existing);
     const next: WorkflowState = {
       ...workflow,
       autoMode: args.autoMode,
       updatedAt: nowIso(),
     };
 
-    await this.persistTaskWorkflow(task, next);
+    await this.persistTaskWorkflow(task, normalizedScope, next);
     this.writePlanFile(task.path, next);
     return next;
   }
@@ -373,13 +480,16 @@ export class WorkflowService {
     taskId: string;
     stepId: string;
     provider?: string;
+    scopeKey?: string;
   }): Promise<{ workflow: WorkflowState; conversationId: string; prompt: string }> {
     const task = await this.getTaskOrThrow(args.taskId);
-    const workflow = this.getWorkflowFromTask(task);
-    if (!workflow) {
-      throw new Error('Workflow is not initialized for this task');
+    const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const existing = this.getWorkflowFromTask(task, normalizedScope);
+    if (!existing) {
+      throw new Error('Workflow is not initialized for this task/scope');
     }
 
+    const workflow = this.syncWorkflowFromPlan(task.path, existing);
     const stepIndex = workflow.steps.findIndex((step) => step.id === args.stepId);
     if (stepIndex < 0) {
       throw new Error(`Step not found: ${args.stepId}`);
@@ -448,7 +558,7 @@ export class WorkflowService {
       updatedAt: nowIso(),
     };
 
-    await this.persistTaskWorkflow(task, next);
+    await this.persistTaskWorkflow(task, normalizedScope, next);
     this.writePlanFile(task.path, next);
 
     return {
@@ -458,13 +568,19 @@ export class WorkflowService {
     };
   }
 
-  async completeStep(args: { taskId: string; stepId: string }): Promise<WorkflowState> {
+  async completeStep(args: {
+    taskId: string;
+    stepId: string;
+    scopeKey?: string;
+  }): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(args.taskId);
-    const workflow = this.getWorkflowFromTask(task);
-    if (!workflow) {
-      throw new Error('Workflow is not initialized for this task');
+    const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const existing = this.getWorkflowFromTask(task, normalizedScope);
+    if (!existing) {
+      throw new Error('Workflow is not initialized for this task/scope');
     }
 
+    const workflow = this.syncWorkflowFromPlan(task.path, existing);
     const step = workflow.steps.find((candidate) => candidate.id === args.stepId);
     if (!step) {
       throw new Error(`Step not found: ${args.stepId}`);
@@ -494,7 +610,7 @@ export class WorkflowService {
       updatedAt: nowIso(),
     };
 
-    await this.persistTaskWorkflow(task, next);
+    await this.persistTaskWorkflow(task, normalizedScope, next);
     this.writePlanFile(task.path, next);
     return next;
   }
@@ -502,11 +618,19 @@ export class WorkflowService {
   async nextStep(args: {
     taskId: string;
     provider?: string;
+    scopeKey?: string;
   }): Promise<{ workflow: WorkflowState; conversationId: string; prompt: string } | null> {
     const task = await this.getTaskOrThrow(args.taskId);
-    const workflow = this.getWorkflowFromTask(task);
-    if (!workflow) {
-      throw new Error('Workflow is not initialized for this task');
+    const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const existing = this.getWorkflowFromTask(task, normalizedScope);
+    if (!existing) {
+      throw new Error('Workflow is not initialized for this task/scope');
+    }
+
+    const workflow = this.syncWorkflowFromPlan(task.path, existing);
+    if (!this.workflowsEqual(workflow, existing)) {
+      await this.persistTaskWorkflow(task, normalizedScope, workflow);
+      this.writePlanFile(task.path, workflow);
     }
 
     const nextPending = workflow.steps
@@ -522,24 +646,20 @@ export class WorkflowService {
       taskId: args.taskId,
       stepId: nextPending.id,
       provider: args.provider,
+      scopeKey: normalizedScope,
     });
   }
 
-  async reparsePlan(taskId: string): Promise<WorkflowState> {
+  async reparsePlan(taskId: string, scopeKey?: string): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(taskId);
-    const workflow = this.getWorkflowFromTask(task);
+    const normalizedScope = normalizeScopeKey(scopeKey);
+    const workflow = this.getWorkflowFromTask(task, normalizedScope);
     if (!workflow) {
-      throw new Error('Workflow is not initialized for this task');
+      throw new Error('Workflow is not initialized for this task/scope');
     }
 
-    const planPath = this.planAbsPath(task.path);
-    if (!fs.existsSync(planPath)) {
-      throw new Error(`Plan file not found: ${planPath}`);
-    }
-
-    const markdown = fs.readFileSync(planPath, 'utf8');
-    const reparsed = this.parsePlanMarkdown(markdown, workflow);
-    await this.persistTaskWorkflow(task, reparsed);
+    const reparsed = this.syncWorkflowFromPlan(task.path, workflow);
+    await this.persistTaskWorkflow(task, normalizedScope, reparsed);
     this.writePlanFile(task.path, reparsed);
     return reparsed;
   }

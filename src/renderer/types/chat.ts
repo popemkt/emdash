@@ -43,6 +43,7 @@ export interface TaskMetadata {
     }>;
     selectedAgent?: ProviderId | null;
   } | null;
+  workflows?: Record<string, WorkflowState> | null;
   workflow?: WorkflowState | null;
 }
 

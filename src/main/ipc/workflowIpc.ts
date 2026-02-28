@@ -12,6 +12,7 @@ export function registerWorkflowIpc(): void {
         taskId: string;
         template: WorkflowTemplate;
         featureDescription: string;
+        scopeKey?: string;
       }
     ) => {
       try {
@@ -27,9 +28,9 @@ export function registerWorkflowIpc(): void {
     }
   );
 
-  ipcMain.handle('workflow:get', async (_, args: { taskId: string }) => {
+  ipcMain.handle('workflow:get', async (_, args: { taskId: string; scopeKey?: string }) => {
     try {
-      const workflow = await workflowService.getWorkflow(args.taskId);
+      const workflow = await workflowService.getWorkflow(args.taskId, args.scopeKey);
       return { success: true, workflow };
     } catch (error) {
       log.error('workflow:get failed', error);
@@ -42,7 +43,7 @@ export function registerWorkflowIpc(): void {
 
   ipcMain.handle(
     'workflow:startStep',
-    async (_, args: { taskId: string; stepId: string; provider?: string }) => {
+    async (_, args: { taskId: string; stepId: string; provider?: string; scopeKey?: string }) => {
       try {
         const result = await workflowService.startStep(args);
         return { success: true, ...result };
@@ -56,35 +57,41 @@ export function registerWorkflowIpc(): void {
     }
   );
 
-  ipcMain.handle('workflow:completeStep', async (_, args: { taskId: string; stepId: string }) => {
-    try {
-      const workflow = await workflowService.completeStep(args);
-      return { success: true, workflow };
-    } catch (error) {
-      log.error('workflow:completeStep failed', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+  ipcMain.handle(
+    'workflow:completeStep',
+    async (_, args: { taskId: string; stepId: string; scopeKey?: string }) => {
+      try {
+        const workflow = await workflowService.completeStep(args);
+        return { success: true, workflow };
+      } catch (error) {
+        log.error('workflow:completeStep failed', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
     }
-  });
+  );
 
-  ipcMain.handle('workflow:nextStep', async (_, args: { taskId: string; provider?: string }) => {
-    try {
-      const result = await workflowService.nextStep(args);
-      return { success: true, result };
-    } catch (error) {
-      log.error('workflow:nextStep failed', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+  ipcMain.handle(
+    'workflow:nextStep',
+    async (_, args: { taskId: string; provider?: string; scopeKey?: string }) => {
+      try {
+        const result = await workflowService.nextStep(args);
+        return { success: true, result };
+      } catch (error) {
+        log.error('workflow:nextStep failed', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
     }
-  });
+  );
 
   ipcMain.handle(
     'workflow:setAutoMode',
-    async (_, args: { taskId: string; autoMode: WorkflowAutoMode }) => {
+    async (_, args: { taskId: string; autoMode: WorkflowAutoMode; scopeKey?: string }) => {
       try {
         const workflow = await workflowService.setAutoMode(args);
         return { success: true, workflow };
@@ -98,9 +105,9 @@ export function registerWorkflowIpc(): void {
     }
   );
 
-  ipcMain.handle('workflow:reparsePlan', async (_, args: { taskId: string }) => {
+  ipcMain.handle('workflow:reparsePlan', async (_, args: { taskId: string; scopeKey?: string }) => {
     try {
-      const workflow = await workflowService.reparsePlan(args.taskId);
+      const workflow = await workflowService.reparsePlan(args.taskId, args.scopeKey);
       return { success: true, workflow };
     } catch (error) {
       log.error('workflow:reparsePlan failed', error);

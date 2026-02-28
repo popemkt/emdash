@@ -514,17 +514,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
     taskId: string;
     template: 'spec-and-build' | 'full-sdd';
     featureDescription: string;
+    scopeKey?: string;
   }) => ipcRenderer.invoke('workflow:create', args),
-  workflowGet: (args: { taskId: string }) => ipcRenderer.invoke('workflow:get', args),
-  workflowStartStep: (args: { taskId: string; stepId: string; provider?: string }) =>
-    ipcRenderer.invoke('workflow:startStep', args),
-  workflowCompleteStep: (args: { taskId: string; stepId: string }) =>
+  workflowGet: (args: { taskId: string; scopeKey?: string }) =>
+    ipcRenderer.invoke('workflow:get', args),
+  workflowStartStep: (args: {
+    taskId: string;
+    stepId: string;
+    provider?: string;
+    scopeKey?: string;
+  }) => ipcRenderer.invoke('workflow:startStep', args),
+  workflowCompleteStep: (args: { taskId: string; stepId: string; scopeKey?: string }) =>
     ipcRenderer.invoke('workflow:completeStep', args),
-  workflowNextStep: (args: { taskId: string; provider?: string }) =>
+  workflowNextStep: (args: { taskId: string; provider?: string; scopeKey?: string }) =>
     ipcRenderer.invoke('workflow:nextStep', args),
-  workflowSetAutoMode: (args: { taskId: string; autoMode: 'manual' | 'auto' }) =>
+  workflowSetAutoMode: (args: { taskId: string; autoMode: 'manual' | 'auto'; scopeKey?: string }) =>
     ipcRenderer.invoke('workflow:setAutoMode', args),
-  workflowReparsePlan: (args: { taskId: string }) =>
+  workflowReparsePlan: (args: { taskId: string; scopeKey?: string }) =>
     ipcRenderer.invoke('workflow:reparsePlan', args),
 
   // Line comments management

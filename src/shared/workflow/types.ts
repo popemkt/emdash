@@ -21,6 +21,7 @@ export interface WorkflowStep {
 
 export interface WorkflowState {
   enabled: true;
+  scopeKey: string;
   type: WorkflowTemplate;
   status: WorkflowStatus;
   autoMode: WorkflowAutoMode;
