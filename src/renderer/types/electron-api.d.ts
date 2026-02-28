@@ -1,6 +1,11 @@
 // Updated for Codex integration
 
 import type { AgentEvent } from '../../shared/agentEvents';
+import type {
+  WorkflowAutoMode,
+  WorkflowState,
+  WorkflowTemplate,
+} from '../../shared/workflow/types';
 
 type ProjectSettingsPayload = {
   projectId: string;
@@ -1134,6 +1139,39 @@ declare global {
         title: string;
       }) => Promise<{ success: boolean; error?: string }>;
 
+      // Workflow orchestration
+      workflowCreate: (args: {
+        taskId: string;
+        template: WorkflowTemplate;
+        featureDescription: string;
+      }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+      workflowGet: (args: {
+        taskId: string;
+      }) => Promise<{ success: boolean; workflow?: WorkflowState | null; error?: string }>;
+      workflowStartStep: (args: { taskId: string; stepId: string; provider?: string }) => Promise<{
+        success: boolean;
+        workflow?: WorkflowState;
+        conversationId?: string;
+        prompt?: string;
+        error?: string;
+      }>;
+      workflowCompleteStep: (args: {
+        taskId: string;
+        stepId: string;
+      }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+      workflowNextStep: (args: { taskId: string; provider?: string }) => Promise<{
+        success: boolean;
+        result?: { workflow: WorkflowState; conversationId: string; prompt: string } | null;
+        error?: string;
+      }>;
+      workflowSetAutoMode: (args: {
+        taskId: string;
+        autoMode: WorkflowAutoMode;
+      }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+      workflowReparsePlan: (args: {
+        taskId: string;
+      }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+
       // Debug helpers
       debugAppendLog: (
         filePath: string,
@@ -1823,6 +1861,39 @@ export interface ElectronAPI {
   getOrCreateDefaultConversation: (
     taskId: string
   ) => Promise<{ success: boolean; conversation?: any; error?: string }>;
+
+  // Workflow orchestration
+  workflowCreate: (args: {
+    taskId: string;
+    template: WorkflowTemplate;
+    featureDescription: string;
+  }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+  workflowGet: (args: {
+    taskId: string;
+  }) => Promise<{ success: boolean; workflow?: WorkflowState | null; error?: string }>;
+  workflowStartStep: (args: { taskId: string; stepId: string; provider?: string }) => Promise<{
+    success: boolean;
+    workflow?: WorkflowState;
+    conversationId?: string;
+    prompt?: string;
+    error?: string;
+  }>;
+  workflowCompleteStep: (args: {
+    taskId: string;
+    stepId: string;
+  }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+  workflowNextStep: (args: { taskId: string; provider?: string }) => Promise<{
+    success: boolean;
+    result?: { workflow: WorkflowState; conversationId: string; prompt: string } | null;
+    error?: string;
+  }>;
+  workflowSetAutoMode: (args: {
+    taskId: string;
+    autoMode: WorkflowAutoMode;
+  }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
+  workflowReparsePlan: (args: {
+    taskId: string;
+  }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
 
   // Debug helpers
   debugAppendLog: (

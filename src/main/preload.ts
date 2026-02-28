@@ -509,6 +509,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateConversationTitle: (params: { conversationId: string; title: string }) =>
     ipcRenderer.invoke('db:updateConversationTitle', params),
 
+  // Workflow orchestration
+  workflowCreate: (args: {
+    taskId: string;
+    template: 'spec-and-build' | 'full-sdd';
+    featureDescription: string;
+  }) => ipcRenderer.invoke('workflow:create', args),
+  workflowGet: (args: { taskId: string }) => ipcRenderer.invoke('workflow:get', args),
+  workflowStartStep: (args: { taskId: string; stepId: string; provider?: string }) =>
+    ipcRenderer.invoke('workflow:startStep', args),
+  workflowCompleteStep: (args: { taskId: string; stepId: string }) =>
+    ipcRenderer.invoke('workflow:completeStep', args),
+  workflowNextStep: (args: { taskId: string; provider?: string }) =>
+    ipcRenderer.invoke('workflow:nextStep', args),
+  workflowSetAutoMode: (args: { taskId: string; autoMode: 'manual' | 'auto' }) =>
+    ipcRenderer.invoke('workflow:setAutoMode', args),
+  workflowReparsePlan: (args: { taskId: string }) =>
+    ipcRenderer.invoke('workflow:reparsePlan', args),
+
   // Line comments management
   lineCommentsCreate: (input: any) => ipcRenderer.invoke('lineComments:create', input),
   lineCommentsGet: (args: { taskId: string; filePath?: string }) =>
