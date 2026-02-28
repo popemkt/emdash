@@ -56,6 +56,13 @@ function parseConversationMetadata(raw: string | null | undefined): Record<strin
   }
 }
 
+function normalizeWorkflowScopeKey(raw: string | null | undefined): string {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!value) return 'default';
+  const normalized = value.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized || 'default';
+}
+
 const ChatInterface: React.FC<Props> = ({
   task,
   projectName: _projectName,
@@ -85,9 +92,7 @@ const ChatInterface: React.FC<Props> = ({
   const [showDeleteChatModal, setShowDeleteChatModal] = useState(false);
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
   const [busyByConversationId, setBusyByConversationId] = useState<Record<string, boolean>>({});
-  const [workflow, setWorkflow] = useState<WorkflowState | null>(
-    (task.metadata?.workflow as WorkflowState | null | undefined) || null
-  );
+  const [workflow, setWorkflow] = useState<WorkflowState | null>(null);
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
@@ -103,6 +108,14 @@ const ChatInterface: React.FC<Props> = ({
   const activeConversationMetadata = useMemo(
     () => parseConversationMetadata(activeConversation?.metadata),
     [activeConversation?.metadata]
+  );
+  const workflowProvider = useMemo(
+    () => (activeConversation?.provider || agent || 'default').trim(),
+    [activeConversation?.provider, agent]
+  );
+  const workflowScopeKey = useMemo(
+    () => normalizeWorkflowScopeKey(workflowProvider),
+    [workflowProvider]
   );
   const activeWorkflowStepPrompt = useMemo(() => {
     const metadata = activeConversationMetadata.workflowStep;
@@ -262,19 +275,28 @@ const ChatInterface: React.FC<Props> = ({
 
   const loadWorkflow = useCallback(async () => {
     try {
-      const result = await window.electronAPI.workflowGet({ taskId: task.id });
+      const result = await window.electronAPI.workflowGet({
+        taskId: task.id,
+        scopeKey: workflowScopeKey,
+      });
       if (result.success) {
         setWorkflow((result.workflow as WorkflowState | null | undefined) || null);
       }
     } catch {
       setWorkflow(null);
     }
-  }, [task.id]);
+  }, [task.id, workflowScopeKey]);
 
   useEffect(() => {
-    setWorkflow((task.metadata?.workflow as WorkflowState | null | undefined) || null);
     void loadWorkflow();
-  }, [task.id, task.metadata?.workflow, loadWorkflow]);
+  }, [loadWorkflow]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadWorkflow();
+    }, 2500);
+    return () => window.clearInterval(intervalId);
+  }, [loadWorkflow]);
 
   // Activity indicators per conversation tab (main PTY uses `task.id`, chat PTYs use `conversation.id`).
   useEffect(() => {
@@ -651,6 +673,7 @@ const ChatInterface: React.FC<Props> = ({
           taskId: task.id,
           template,
           featureDescription: task.name,
+          scopeKey: workflowScopeKey,
         });
         if (!result.success || !result.workflow) {
           throw new Error(result.error || 'Failed to initialize workflow');
@@ -666,7 +689,7 @@ const ChatInterface: React.FC<Props> = ({
         setWorkflowBusy(false);
       }
     },
-    [task.id, task.name, toast]
+    [task.id, task.name, toast, workflowScopeKey]
   );
 
   const handleStartWorkflowStep = useCallback(
@@ -676,7 +699,8 @@ const ChatInterface: React.FC<Props> = ({
         const result = await window.electronAPI.workflowStartStep({
           taskId: task.id,
           stepId,
-          provider: agent,
+          provider: workflowProvider,
+          scopeKey: workflowScopeKey,
         });
         if (!result.success || !result.workflow) {
           throw new Error(result.error || 'Failed to start step');
@@ -693,7 +717,7 @@ const ChatInterface: React.FC<Props> = ({
         setWorkflowBusy(false);
       }
     },
-    [task.id, agent, reloadConversations, toast]
+    [task.id, workflowProvider, workflowScopeKey, reloadConversations, toast]
   );
 
   const handleCompleteWorkflowStep = useCallback(
@@ -703,6 +727,7 @@ const ChatInterface: React.FC<Props> = ({
         const result = await window.electronAPI.workflowCompleteStep({
           taskId: task.id,
           stepId: step.id,
+          scopeKey: workflowScopeKey,
         });
         if (!result.success || !result.workflow) {
           throw new Error(result.error || 'Failed to complete step');
@@ -712,7 +737,8 @@ const ChatInterface: React.FC<Props> = ({
         if (result.workflow.autoMode === 'auto' && !step.pausePoint) {
           const next = await window.electronAPI.workflowNextStep({
             taskId: task.id,
-            provider: agent,
+            provider: workflowProvider,
+            scopeKey: workflowScopeKey,
           });
           if (next.success && next.result) {
             nextWorkflow = next.result.workflow;
@@ -731,7 +757,7 @@ const ChatInterface: React.FC<Props> = ({
         setWorkflowBusy(false);
       }
     },
-    [task.id, agent, reloadConversations, toast]
+    [task.id, workflowProvider, workflowScopeKey, reloadConversations, toast]
   );
 
   const handleNextWorkflowStep = useCallback(async () => {
@@ -739,7 +765,8 @@ const ChatInterface: React.FC<Props> = ({
     try {
       const result = await window.electronAPI.workflowNextStep({
         taskId: task.id,
-        provider: agent,
+        provider: workflowProvider,
+        scopeKey: workflowScopeKey,
       });
       if (!result.success) {
         throw new Error(result.error || 'Failed to start next step');
@@ -757,7 +784,7 @@ const ChatInterface: React.FC<Props> = ({
     } finally {
       setWorkflowBusy(false);
     }
-  }, [task.id, agent, reloadConversations, toast]);
+  }, [task.id, workflowProvider, workflowScopeKey, reloadConversations, toast]);
 
   const handleToggleWorkflowAuto = useCallback(async () => {
     if (!workflow) return;
@@ -767,6 +794,7 @@ const ChatInterface: React.FC<Props> = ({
       const result = await window.electronAPI.workflowSetAutoMode({
         taskId: task.id,
         autoMode: nextMode,
+        scopeKey: workflowScopeKey,
       });
       if (!result.success || !result.workflow) {
         throw new Error(result.error || 'Failed to update workflow mode');
@@ -781,12 +809,15 @@ const ChatInterface: React.FC<Props> = ({
     } finally {
       setWorkflowBusy(false);
     }
-  }, [workflow, task.id, toast]);
+  }, [workflow, task.id, workflowScopeKey, toast]);
 
   const handleReparseWorkflowPlan = useCallback(async () => {
     setWorkflowBusy(true);
     try {
-      const result = await window.electronAPI.workflowReparsePlan({ taskId: task.id });
+      const result = await window.electronAPI.workflowReparsePlan({
+        taskId: task.id,
+        scopeKey: workflowScopeKey,
+      });
       if (!result.success || !result.workflow) {
         throw new Error(result.error || 'Failed to reparse workflow plan');
       }
@@ -800,7 +831,7 @@ const ChatInterface: React.FC<Props> = ({
     } finally {
       setWorkflowBusy(false);
     }
-  }, [task.id, toast]);
+  }, [task.id, workflowScopeKey, toast]);
 
   // Persist last-selected agent per task (including Droid)
   useEffect(() => {
@@ -1130,6 +1161,7 @@ const ChatInterface: React.FC<Props> = ({
                 {!workflow ? (
                   <div className="flex flex-wrap items-center gap-2 text-xs">
                     <span className="font-medium text-foreground">Workflow:</span>
+                    <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
                     <button
                       onClick={() => void handleInitializeWorkflow('full-sdd')}
                       disabled={workflowBusy}
@@ -1148,6 +1180,7 @@ const ChatInterface: React.FC<Props> = ({
                 ) : (
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
                       <Badge variant="outline">
                         {workflow.type === 'full-sdd' ? 'Full SDD' : 'Spec & Build'}
                       </Badge>
