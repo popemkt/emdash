@@ -15,12 +15,12 @@ import { classifyActivity } from '@/lib/activityClassifier';
 import { activityStore } from '@/lib/activityStore';
 import { Spinner } from './ui/spinner';
 import { BUSY_HOLD_MS, CLEAR_BUSY_MS, INJECT_ENTER_DELAY_MS } from '@/lib/activityConstants';
-import { CornerDownLeft } from 'lucide-react';
+import { Check, CornerDownLeft, Pause, Play } from 'lucide-react';
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { getTaskEnvVars } from '@shared/task/envVars';
-import type { WorkflowState, WorkflowTemplate } from '@shared/workflow/types';
+import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
 
 interface Props {
   task: Task;
@@ -57,6 +57,13 @@ function workflowTemplateLabel(template: WorkflowTemplate): string {
   if (template === 'full-sdd') return 'Full SDD';
   if (template === 'spec-and-build') return 'Spec & Build';
   return 'Simple Prompt';
+}
+
+function statusDotClass(status: WorkflowStep['status']): string {
+  if (status === 'completed') return 'bg-green-500';
+  if (status === 'blocked') return 'bg-red-500';
+  if (status === 'in_progress') return 'bg-amber-500';
+  return 'bg-muted-foreground/50';
 }
 
 const MultiAgentTask: React.FC<Props> = ({
@@ -221,6 +228,130 @@ const MultiAgentTask: React.FC<Props> = ({
       setWorkflowBusy(false);
     }
   }, [variants, initializeWorkflowForVariant, workflowTemplate, loadActiveWorkflow, toast]);
+
+  const handleStartWorkflowStep = useCallback(
+    async (stepId: string) => {
+      if (!activeVariant || !activeWorkflowScope) return;
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowStartStep({
+          taskId: task.id,
+          stepId,
+          provider: activeVariant.agent,
+          scopeKey: activeWorkflowScope,
+          taskPathOverride: activeVariant.path,
+        });
+        if (!result.success || !result.workflow) {
+          throw new Error(result.error || 'Failed to start step');
+        }
+        setActiveWorkflow(result.workflow);
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to start step',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, activeVariant, activeWorkflowScope, toast]
+  );
+
+  const handleCompleteWorkflowStep = useCallback(
+    async (step: WorkflowStep) => {
+      if (!activeVariant || !activeWorkflowScope) return;
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowCompleteStep({
+          taskId: task.id,
+          stepId: step.id,
+          scopeKey: activeWorkflowScope,
+          taskPathOverride: activeVariant.path,
+        });
+        if (!result.success || !result.workflow) {
+          throw new Error(result.error || 'Failed to complete step');
+        }
+
+        let nextWorkflow = result.workflow;
+        if (result.workflow.autoMode === 'auto' && !step.pausePoint) {
+          const next = await window.electronAPI.workflowNextStep({
+            taskId: task.id,
+            provider: activeVariant.agent,
+            scopeKey: activeWorkflowScope,
+            taskPathOverride: activeVariant.path,
+          });
+          if (next.success && next.result) {
+            nextWorkflow = next.result.workflow;
+          }
+        }
+
+        setActiveWorkflow(nextWorkflow);
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to complete step',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, activeVariant, activeWorkflowScope, toast]
+  );
+
+  const handleNextWorkflowStep = useCallback(async () => {
+    if (!activeVariant || !activeWorkflowScope) return;
+    setWorkflowBusy(true);
+    try {
+      const result = await window.electronAPI.workflowNextStep({
+        taskId: task.id,
+        provider: activeVariant.agent,
+        scopeKey: activeWorkflowScope,
+        taskPathOverride: activeVariant.path,
+      });
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to start next step');
+      }
+      if (result.result) {
+        setActiveWorkflow(result.result.workflow);
+      }
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to start next step',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [task.id, activeVariant, activeWorkflowScope, toast]);
+
+  const handleToggleWorkflowAuto = useCallback(async () => {
+    if (!activeWorkflow || !activeVariant || !activeWorkflowScope) return;
+    setWorkflowBusy(true);
+    try {
+      const nextMode = activeWorkflow.autoMode === 'auto' ? 'manual' : 'auto';
+      const result = await window.electronAPI.workflowSetAutoMode({
+        taskId: task.id,
+        autoMode: nextMode,
+        scopeKey: activeWorkflowScope,
+        taskPathOverride: activeVariant.path,
+      });
+      if (!result.success || !result.workflow) {
+        throw new Error(result.error || 'Failed to update workflow mode');
+      }
+      setActiveWorkflow(result.workflow);
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to update workflow mode',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [activeWorkflow, task.id, activeVariant, activeWorkflowScope, toast]);
 
   // Build initial issue context (feature parity with single-agent ChatInterface)
   const initialInjection: string | null = useMemo(() => {
@@ -605,52 +736,174 @@ const MultiAgentTask: React.FC<Props> = ({
               </div>
               <div className="px-6 pt-2">
                 <div className="mx-auto max-w-4xl rounded-md border border-border/70 bg-muted/30 p-2">
-                  <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="font-medium text-foreground">Workflow:</span>
-                    <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
-                    {isActive && activeWorkflow ? (
-                      <>
+                  {isActive && activeWorkflow ? (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-medium text-foreground">Workflow:</span>
+                        <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
                         <Badge variant="outline">
                           {workflowTemplateLabel(activeWorkflow.type)}
                         </Badge>
                         <Badge variant="secondary">{activeWorkflow.status.replace('_', ' ')}</Badge>
                         <Badge variant="outline">{activeWorkflow.steps.length} steps</Badge>
-                      </>
-                    ) : null}
-                    <Select
-                      value={workflowTemplate}
-                      onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
-                    >
-                      <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent side="top" className="z-[120]">
-                        <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
-                        <SelectItem value="spec-and-build">Spec & Build</SelectItem>
-                        <SelectItem value="full-sdd">Full SDD</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={workflowBusy || !isActive}
-                      onClick={() => void handleInitWorkflowForActive()}
-                      className="h-7 px-2.5 text-xs"
-                    >
-                      Init Active
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={workflowBusy}
-                      onClick={() => void handleInitWorkflowForAll()}
-                      className="h-7 px-2.5 text-xs"
-                    >
-                      Init All Agents
-                    </Button>
-                  </div>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleToggleWorkflowAuto()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          {activeWorkflow.autoMode === 'auto' ? (
+                            <>
+                              <Pause className="mr-1.5 h-3.5 w-3.5" />
+                              Auto: On
+                            </>
+                          ) : (
+                            <>
+                              <Play className="mr-1.5 h-3.5 w-3.5" />
+                              Auto: Off
+                            </>
+                          )}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleNextWorkflowStep()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          Next Step
+                        </Button>
+                        <Select
+                          value={workflowTemplate}
+                          onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                        >
+                          <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent side="top" className="z-[120]">
+                            <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                            <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                            <SelectItem value="full-sdd">Full SDD</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleInitWorkflowForActive()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          Re-init Active
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleInitWorkflowForAll()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          Init All Agents
+                        </Button>
+                      </div>
+                      <div className="space-y-1">
+                        {activeWorkflow.steps
+                          .slice()
+                          .sort((a, b) => a.number - b.number)
+                          .map((step) => {
+                            const isCurrent = activeWorkflow.currentStepId === step.id;
+                            return (
+                              <div
+                                key={step.id}
+                                className={`flex flex-wrap items-center gap-2 rounded border border-border/60 bg-background px-2 py-1 text-xs ${
+                                  isCurrent ? 'border-foreground/30' : ''
+                                }`}
+                              >
+                                <span
+                                  className={`h-2 w-2 rounded-full ${statusDotClass(step.status)}`}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => void handleStartWorkflowStep(step.id)}
+                                  disabled={workflowBusy}
+                                  className="font-medium text-foreground hover:underline disabled:no-underline disabled:opacity-70"
+                                >
+                                  Step {step.number}: {step.title}
+                                </button>
+                                {step.pausePoint ? (
+                                  <span className="text-muted-foreground">(pause)</span>
+                                ) : null}
+                                <span className="text-muted-foreground">
+                                  chat:{' '}
+                                  {step.conversationId ? (
+                                    <code>{step.conversationId}</code>
+                                  ) : (
+                                    <code>none</code>
+                                  )}
+                                </span>
+                                {step.status !== 'completed' ? (
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => void handleCompleteWorkflowStep(step)}
+                                    disabled={workflowBusy || step.status === 'pending'}
+                                    className="ml-auto h-6 px-2 text-xs"
+                                  >
+                                    <Check className="mr-1 h-3 w-3" />
+                                    Complete
+                                  </Button>
+                                ) : (
+                                  <span className="ml-auto text-green-600">done</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-medium text-foreground">Workflow:</span>
+                      <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
+                      <Select
+                        value={workflowTemplate}
+                        onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                      >
+                        <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent side="top" className="z-[120]">
+                          <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                          <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                          <SelectItem value="full-sdd">Full SDD</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={workflowBusy || !isActive}
+                        onClick={() => void handleInitWorkflowForActive()}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Init Active
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={workflowBusy}
+                        onClick={() => void handleInitWorkflowForAll()}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Init All Agents
+                      </Button>
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="mt-2 flex items-center justify-center px-4 py-2">
