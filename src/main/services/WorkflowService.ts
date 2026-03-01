@@ -40,6 +40,19 @@ type StepSeed = {
 type WorkflowStorage = Record<string, WorkflowState>;
 
 function buildTemplateSteps(template: WorkflowTemplate): StepSeed[] {
+  if (template === 'simple-prompt') {
+    return [
+      {
+        number: 1,
+        title: 'Implementation',
+        instructions:
+          'Implement the requested change directly. Summarize completed work and open items in report.md.',
+        pausePoint: false,
+        artifacts: ['report.md'],
+      },
+    ];
+  }
+
   if (template === 'spec-and-build') {
     return [
       {
@@ -213,6 +226,12 @@ export class WorkflowService {
     const nextTask = this.withWorkflowMetadata(task, scopeKey, workflow);
     await databaseService.saveTask(nextTask);
     return workflow;
+  }
+
+  private resolveTaskPath(task: Task, taskPathOverride?: string): string {
+    const override = typeof taskPathOverride === 'string' ? taskPathOverride.trim() : '';
+    if (override) return override;
+    return task.path;
   }
 
   private ensureWorkflowDir(taskPath: string, workflow: WorkflowState): string {
@@ -399,9 +418,11 @@ export class WorkflowService {
     template: WorkflowTemplate;
     featureDescription: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(args.taskId);
     const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const taskPath = this.resolveTaskPath(task, args.taskPathOverride);
     const featureDescription = args.featureDescription?.trim() || task.name;
     const createdAt = nowIso();
     const paths = resolveWorkflowPaths(task.id, normalizedScope);
@@ -433,17 +454,22 @@ export class WorkflowService {
     };
 
     await this.persistTaskWorkflow(task, normalizedScope, workflow);
-    this.writePlanFile(task.path, workflow);
+    this.writePlanFile(taskPath, workflow);
     return workflow;
   }
 
-  async getWorkflow(taskId: string, scopeKey?: string): Promise<WorkflowState | null> {
+  async getWorkflow(
+    taskId: string,
+    scopeKey?: string,
+    taskPathOverride?: string
+  ): Promise<WorkflowState | null> {
     const task = await this.getTaskOrThrow(taskId);
     const normalizedScope = normalizeScopeKey(scopeKey);
+    const taskPath = this.resolveTaskPath(task, taskPathOverride);
     const workflow = this.getWorkflowFromTask(task, normalizedScope);
     if (!workflow) return null;
 
-    const synced = this.syncWorkflowFromPlan(task.path, workflow);
+    const synced = this.syncWorkflowFromPlan(taskPath, workflow);
     if (!this.workflowsEqual(synced, workflow)) {
       await this.persistTaskWorkflow(task, normalizedScope, synced);
       return synced;
@@ -456,15 +482,17 @@ export class WorkflowService {
     taskId: string;
     autoMode: WorkflowAutoMode;
     scopeKey?: string;
+    taskPathOverride?: string;
   }): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(args.taskId);
     const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const taskPath = this.resolveTaskPath(task, args.taskPathOverride);
     const existing = this.getWorkflowFromTask(task, normalizedScope);
     if (!existing) {
       throw new Error('Workflow is not initialized for this task/scope');
     }
 
-    const workflow = this.syncWorkflowFromPlan(task.path, existing);
+    const workflow = this.syncWorkflowFromPlan(taskPath, existing);
     const next: WorkflowState = {
       ...workflow,
       autoMode: args.autoMode,
@@ -472,7 +500,7 @@ export class WorkflowService {
     };
 
     await this.persistTaskWorkflow(task, normalizedScope, next);
-    this.writePlanFile(task.path, next);
+    this.writePlanFile(taskPath, next);
     return next;
   }
 
@@ -481,15 +509,17 @@ export class WorkflowService {
     stepId: string;
     provider?: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }): Promise<{ workflow: WorkflowState; conversationId: string; prompt: string }> {
     const task = await this.getTaskOrThrow(args.taskId);
     const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const taskPath = this.resolveTaskPath(task, args.taskPathOverride);
     const existing = this.getWorkflowFromTask(task, normalizedScope);
     if (!existing) {
       throw new Error('Workflow is not initialized for this task/scope');
     }
 
-    const workflow = this.syncWorkflowFromPlan(task.path, existing);
+    const workflow = this.syncWorkflowFromPlan(taskPath, existing);
     const stepIndex = workflow.steps.findIndex((step) => step.id === args.stepId);
     if (stepIndex < 0) {
       throw new Error(`Step not found: ${args.stepId}`);
@@ -559,7 +589,7 @@ export class WorkflowService {
     };
 
     await this.persistTaskWorkflow(task, normalizedScope, next);
-    this.writePlanFile(task.path, next);
+    this.writePlanFile(taskPath, next);
 
     return {
       workflow: next,
@@ -572,15 +602,17 @@ export class WorkflowService {
     taskId: string;
     stepId: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(args.taskId);
     const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const taskPath = this.resolveTaskPath(task, args.taskPathOverride);
     const existing = this.getWorkflowFromTask(task, normalizedScope);
     if (!existing) {
       throw new Error('Workflow is not initialized for this task/scope');
     }
 
-    const workflow = this.syncWorkflowFromPlan(task.path, existing);
+    const workflow = this.syncWorkflowFromPlan(taskPath, existing);
     const step = workflow.steps.find((candidate) => candidate.id === args.stepId);
     if (!step) {
       throw new Error(`Step not found: ${args.stepId}`);
@@ -611,7 +643,7 @@ export class WorkflowService {
     };
 
     await this.persistTaskWorkflow(task, normalizedScope, next);
-    this.writePlanFile(task.path, next);
+    this.writePlanFile(taskPath, next);
     return next;
   }
 
@@ -619,18 +651,20 @@ export class WorkflowService {
     taskId: string;
     provider?: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }): Promise<{ workflow: WorkflowState; conversationId: string; prompt: string } | null> {
     const task = await this.getTaskOrThrow(args.taskId);
     const normalizedScope = normalizeScopeKey(args.scopeKey);
+    const taskPath = this.resolveTaskPath(task, args.taskPathOverride);
     const existing = this.getWorkflowFromTask(task, normalizedScope);
     if (!existing) {
       throw new Error('Workflow is not initialized for this task/scope');
     }
 
-    const workflow = this.syncWorkflowFromPlan(task.path, existing);
+    const workflow = this.syncWorkflowFromPlan(taskPath, existing);
     if (!this.workflowsEqual(workflow, existing)) {
       await this.persistTaskWorkflow(task, normalizedScope, workflow);
-      this.writePlanFile(task.path, workflow);
+      this.writePlanFile(taskPath, workflow);
     }
 
     const nextPending = workflow.steps
@@ -647,20 +681,26 @@ export class WorkflowService {
       stepId: nextPending.id,
       provider: args.provider,
       scopeKey: normalizedScope,
+      taskPathOverride: args.taskPathOverride,
     });
   }
 
-  async reparsePlan(taskId: string, scopeKey?: string): Promise<WorkflowState> {
+  async reparsePlan(
+    taskId: string,
+    scopeKey?: string,
+    taskPathOverride?: string
+  ): Promise<WorkflowState> {
     const task = await this.getTaskOrThrow(taskId);
     const normalizedScope = normalizeScopeKey(scopeKey);
+    const taskPath = this.resolveTaskPath(task, taskPathOverride);
     const workflow = this.getWorkflowFromTask(task, normalizedScope);
     if (!workflow) {
       throw new Error('Workflow is not initialized for this task/scope');
     }
 
-    const reparsed = this.syncWorkflowFromPlan(task.path, workflow);
+    const reparsed = this.syncWorkflowFromPlan(taskPath, workflow);
     await this.persistTaskWorkflow(task, normalizedScope, reparsed);
-    this.writePlanFile(task.path, reparsed);
+    this.writePlanFile(taskPath, reparsed);
     return reparsed;
   }
 }

@@ -123,4 +123,25 @@ describe('WorkflowService scoped plans', () => {
     expect(codexWorkflow?.planRelPath).toBe('.zenflow/task-agent-scope/codex/plan.md');
     expect(claudeWorkflow?.planRelPath).toBe('.zenflow/task-agent-scope/claude/plan.md');
   });
+
+  it('supports simple-prompt template and taskPathOverride', async () => {
+    const overrideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'emdash-workflow-override-'));
+    try {
+      const workflow = await service.createWorkflow({
+        taskId: storedTask.id,
+        template: 'simple-prompt',
+        featureDescription: 'Just implement it',
+        scopeKey: 'codex-main-123',
+        taskPathOverride: overrideDir,
+      });
+
+      expect(workflow.steps).toHaveLength(1);
+      expect(workflow.steps[0]?.title).toBe('Implementation');
+
+      const planPath = path.join(overrideDir, '.zenflow/task-agent-scope/codex-main-123/plan.md');
+      expect(fs.existsSync(planPath)).toBe(true);
+    } finally {
+      fs.rmSync(overrideDir, { recursive: true, force: true });
+    }
+  });
 });

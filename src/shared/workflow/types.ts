@@ -1,4 +1,4 @@
-export type WorkflowTemplate = 'spec-and-build' | 'full-sdd';
+export type WorkflowTemplate = 'simple-prompt' | 'spec-and-build' | 'full-sdd';
 
 export type WorkflowStatus = 'planning' | 'in_progress' | 'paused' | 'completed' | 'blocked';
 

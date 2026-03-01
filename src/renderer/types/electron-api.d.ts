@@ -1145,16 +1145,19 @@ declare global {
         template: WorkflowTemplate;
         featureDescription: string;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
       workflowGet: (args: {
         taskId: string;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{ success: boolean; workflow?: WorkflowState | null; error?: string }>;
       workflowStartStep: (args: {
         taskId: string;
         stepId: string;
         provider?: string;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{
         success: boolean;
         workflow?: WorkflowState;
@@ -1166,11 +1169,13 @@ declare global {
         taskId: string;
         stepId: string;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
       workflowNextStep: (args: {
         taskId: string;
         provider?: string;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{
         success: boolean;
         result?: { workflow: WorkflowState; conversationId: string; prompt: string } | null;
@@ -1180,10 +1185,12 @@ declare global {
         taskId: string;
         autoMode: WorkflowAutoMode;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
       workflowReparsePlan: (args: {
         taskId: string;
         scopeKey?: string;
+        taskPathOverride?: string;
       }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
 
       // Debug helpers
@@ -1882,16 +1889,19 @@ export interface ElectronAPI {
     template: WorkflowTemplate;
     featureDescription: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
   workflowGet: (args: {
     taskId: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => Promise<{ success: boolean; workflow?: WorkflowState | null; error?: string }>;
   workflowStartStep: (args: {
     taskId: string;
     stepId: string;
     provider?: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => Promise<{
     success: boolean;
     workflow?: WorkflowState;
@@ -1903,8 +1913,14 @@ export interface ElectronAPI {
     taskId: string;
     stepId: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
-  workflowNextStep: (args: { taskId: string; provider?: string; scopeKey?: string }) => Promise<{
+  workflowNextStep: (args: {
+    taskId: string;
+    provider?: string;
+    scopeKey?: string;
+    taskPathOverride?: string;
+  }) => Promise<{
     success: boolean;
     result?: { workflow: WorkflowState; conversationId: string; prompt: string } | null;
     error?: string;
@@ -1913,10 +1929,12 @@ export interface ElectronAPI {
     taskId: string;
     autoMode: WorkflowAutoMode;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
   workflowReparsePlan: (args: {
     taskId: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => Promise<{ success: boolean; workflow?: WorkflowState; error?: string }>;
 
   // Debug helpers

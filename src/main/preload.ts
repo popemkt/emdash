@@ -512,25 +512,39 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Workflow orchestration
   workflowCreate: (args: {
     taskId: string;
-    template: 'spec-and-build' | 'full-sdd';
+    template: 'simple-prompt' | 'spec-and-build' | 'full-sdd';
     featureDescription: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => ipcRenderer.invoke('workflow:create', args),
-  workflowGet: (args: { taskId: string; scopeKey?: string }) =>
+  workflowGet: (args: { taskId: string; scopeKey?: string; taskPathOverride?: string }) =>
     ipcRenderer.invoke('workflow:get', args),
   workflowStartStep: (args: {
     taskId: string;
     stepId: string;
     provider?: string;
     scopeKey?: string;
+    taskPathOverride?: string;
   }) => ipcRenderer.invoke('workflow:startStep', args),
-  workflowCompleteStep: (args: { taskId: string; stepId: string; scopeKey?: string }) =>
-    ipcRenderer.invoke('workflow:completeStep', args),
-  workflowNextStep: (args: { taskId: string; provider?: string; scopeKey?: string }) =>
-    ipcRenderer.invoke('workflow:nextStep', args),
-  workflowSetAutoMode: (args: { taskId: string; autoMode: 'manual' | 'auto'; scopeKey?: string }) =>
-    ipcRenderer.invoke('workflow:setAutoMode', args),
-  workflowReparsePlan: (args: { taskId: string; scopeKey?: string }) =>
+  workflowCompleteStep: (args: {
+    taskId: string;
+    stepId: string;
+    scopeKey?: string;
+    taskPathOverride?: string;
+  }) => ipcRenderer.invoke('workflow:completeStep', args),
+  workflowNextStep: (args: {
+    taskId: string;
+    provider?: string;
+    scopeKey?: string;
+    taskPathOverride?: string;
+  }) => ipcRenderer.invoke('workflow:nextStep', args),
+  workflowSetAutoMode: (args: {
+    taskId: string;
+    autoMode: 'manual' | 'auto';
+    scopeKey?: string;
+    taskPathOverride?: string;
+  }) => ipcRenderer.invoke('workflow:setAutoMode', args),
+  workflowReparsePlan: (args: { taskId: string; scopeKey?: string; taskPathOverride?: string }) =>
     ipcRenderer.invoke('workflow:reparsePlan', args),
 
   // Line comments management
