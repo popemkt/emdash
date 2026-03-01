@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
-import { Check, Pause, Play, Plus, X } from 'lucide-react';
+import { Check, CornerDownLeft, Pause, Play, Plus, X } from 'lucide-react';
 import { useToast } from '../hooks/use-toast';
 import { useTheme } from '../hooks/useTheme';
 import { TerminalPane } from './TerminalPane';
@@ -26,6 +26,8 @@ import { type Conversation } from '../../main/services/DatabaseService';
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { makePtyId } from '@shared/ptyId';
+import { Input } from './ui/input';
+import { Button } from './ui/button';
 import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
 
 declare const window: Window & {
@@ -98,6 +100,7 @@ const ChatInterface: React.FC<Props> = ({
   const [showDeleteChatModal, setShowDeleteChatModal] = useState(false);
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
   const [busyByConversationId, setBusyByConversationId] = useState<Record<string, boolean>>({});
+  const [messageBarPrompt, setMessageBarPrompt] = useState('');
   const [workflow, setWorkflow] = useState<WorkflowState | null>(null);
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const tabsContainerRef = useRef<HTMLDivElement>(null);
@@ -1112,6 +1115,20 @@ const ChatInterface: React.FC<Props> = ({
     } catch {}
   }, [agent, task.id]);
 
+  const handleSendMessageBar = useCallback(() => {
+    const trimmed = messageBarPrompt.trim();
+    if (!trimmed || !conversationsLoaded) return;
+    try {
+      window.electronAPI.ptyInput({ id: terminalId, data: trimmed + '\r\n' });
+      window.setTimeout(() => {
+        window.electronAPI.ptyInput({ id: terminalId, data: '\r' });
+      }, 120);
+      setMessageBarPrompt('');
+    } catch (error) {
+      console.error('Failed to send message bar prompt', error);
+    }
+  }, [messageBarPrompt, conversationsLoaded, terminalId]);
+
   if (!isTerminal) {
     return null;
   }
@@ -1528,6 +1545,39 @@ const ChatInterface: React.FC<Props> = ({
                   className="h-full w-full"
                 />
               )}
+            </div>
+          </div>
+          <div className="px-6 pb-6 pt-4">
+            <div className="mx-auto max-w-4xl">
+              <div className="relative rounded-md border border-border bg-white shadow-lg dark:border-border dark:bg-card">
+                <div className="flex items-center gap-2 rounded-md px-4 py-3">
+                  <Input
+                    className="h-9 flex-1 border-border bg-muted dark:border-border dark:bg-muted"
+                    placeholder="Send a message to this agent..."
+                    value={messageBarPrompt}
+                    onChange={(e) => setMessageBarPrompt(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        if (messageBarPrompt.trim()) {
+                          handleSendMessageBar();
+                        }
+                      }
+                    }}
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 border border-border bg-muted px-3 text-xs font-medium hover:bg-muted dark:border-border dark:bg-muted dark:hover:bg-muted"
+                    onClick={handleSendMessageBar}
+                    disabled={!messageBarPrompt.trim() || !conversationsLoaded}
+                    title="Send to active chat (Enter)"
+                    aria-label="Send to active chat"
+                  >
+                    <CornerDownLeft className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
