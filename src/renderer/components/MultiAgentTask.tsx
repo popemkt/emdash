@@ -20,6 +20,8 @@ import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/t
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { getTaskEnvVars } from '@shared/task/envVars';
+import { makePtyId } from '@shared/ptyId';
+import type { ProviderId } from '@shared/providers/registry';
 import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
 
 interface Props {
@@ -53,6 +55,14 @@ function getVariantWorkflowScope(variant: Variant): string {
   return normalizeWorkflowScopeKey(variant.worktreeId || variant.id || variant.agent);
 }
 
+function getVariantMainPtyId(variant: Variant): string {
+  return makePtyId(variant.agent as ProviderId, 'main', variant.worktreeId);
+}
+
+function getVariantChatPtyId(variant: Variant, conversationId: string): string {
+  return makePtyId(variant.agent as ProviderId, 'chat', conversationId);
+}
+
 function workflowTemplateLabel(template: WorkflowTemplate): string {
   if (template === 'full-sdd') return 'Full SDD';
   if (template === 'spec-and-build') return 'Spec & Build';
@@ -82,10 +92,23 @@ const MultiAgentTask: React.FC<Props> = ({
   const [activeWorkflow, setActiveWorkflow] = useState<WorkflowState | null>(null);
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [workflowTemplate, setWorkflowTemplate] = useState<WorkflowTemplate>('simple-prompt');
+  const [variantSessionConversationIds, setVariantSessionConversationIds] = useState<
+    Record<string, string | null>
+  >({});
   const multi = task.metadata?.multiAgent;
   const variants = (multi?.variants || []) as Variant[];
   const activeVariant = variants[activeTabIndex] || null;
   const activeWorkflowScope = activeVariant ? getVariantWorkflowScope(activeVariant) : null;
+  const getVariantTerminalId = useCallback(
+    (variant: Variant) => {
+      const conversationId = variantSessionConversationIds[variant.worktreeId];
+      if (conversationId) {
+        return getVariantChatPtyId(variant, conversationId);
+      }
+      return getVariantMainPtyId(variant);
+    },
+    [variantSessionConversationIds]
+  );
 
   const variantEnvs = useMemo(() => {
     if (!projectPath) return new Map<string, Record<string, string>>();
@@ -118,6 +141,16 @@ const MultiAgentTask: React.FC<Props> = ({
     readySignaledTaskIdRef.current = task.id;
     onTaskInterfaceReady();
   }, [task.id, variants.length, onTaskInterfaceReady]);
+
+  useEffect(() => {
+    setVariantSessionConversationIds((prev) => {
+      const next: Record<string, string | null> = {};
+      for (const variant of variants) {
+        next[variant.worktreeId] = prev[variant.worktreeId] ?? null;
+      }
+      return next;
+    });
+  }, [variants]);
 
   // Helper to generate display label with instance number if needed
   const getVariantDisplayLabel = (variant: Variant): string => {
@@ -187,6 +220,10 @@ const MultiAgentTask: React.FC<Props> = ({
       if (!result.success || !result.workflow) {
         throw new Error(result.error || 'Failed to initialize workflow');
       }
+      setVariantSessionConversationIds((prev) => ({
+        ...prev,
+        [variant.worktreeId]: null,
+      }));
       if (variant.worktreeId === activeVariant?.worktreeId) {
         setActiveWorkflow(result.workflow);
       }
@@ -214,9 +251,21 @@ const MultiAgentTask: React.FC<Props> = ({
     if (variants.length === 0) return;
     setWorkflowBusy(true);
     try {
-      await Promise.all(
-        variants.map((variant) => initializeWorkflowForVariant(variant, workflowTemplate))
+      const orderedVariants = activeVariant
+        ? [
+            activeVariant,
+            ...variants.filter((variant) => variant.worktreeId !== activeVariant.worktreeId),
+          ]
+        : variants;
+      const results = await Promise.allSettled(
+        orderedVariants.map((variant) => initializeWorkflowForVariant(variant, workflowTemplate))
       );
+      const failed = results.filter(
+        (result) => result.status === 'rejected'
+      ) as PromiseRejectedResult[];
+      if (failed.length > 0) {
+        throw new Error(failed[0]?.reason?.message || 'Failed to initialize one or more workflows');
+      }
       await loadActiveWorkflow();
     } catch (error) {
       toast({
@@ -227,7 +276,14 @@ const MultiAgentTask: React.FC<Props> = ({
     } finally {
       setWorkflowBusy(false);
     }
-  }, [variants, initializeWorkflowForVariant, workflowTemplate, loadActiveWorkflow, toast]);
+  }, [
+    variants,
+    activeVariant,
+    initializeWorkflowForVariant,
+    workflowTemplate,
+    loadActiveWorkflow,
+    toast,
+  ]);
 
   const handleStartWorkflowStep = useCallback(
     async (stepId: string) => {
@@ -245,6 +301,16 @@ const MultiAgentTask: React.FC<Props> = ({
           throw new Error(result.error || 'Failed to start step');
         }
         setActiveWorkflow(result.workflow);
+        if (result.conversationId) {
+          setVariantSessionConversationIds((prev) => ({
+            ...prev,
+            [activeVariant.worktreeId]: result.conversationId || null,
+          }));
+          if (result.prompt) {
+            const ptyId = getVariantChatPtyId(activeVariant, result.conversationId);
+            void injectPrompt(ptyId, activeVariant.agent, result.prompt);
+          }
+        }
       } catch (error) {
         toast({
           title: 'Workflow Error',
@@ -446,7 +512,7 @@ const MultiAgentTask: React.FC<Props> = ({
     return null;
   }, [task.metadata]);
 
-  const injectPrompt = async (ptyId: string, agent: Agent, text: string) => {
+  async function injectPrompt(ptyId: string, agent: Agent, text: string) {
     const trimmed = (text || '').trim();
     if (!trimmed) return;
     let sent = false;
@@ -503,7 +569,7 @@ const MultiAgentTask: React.FC<Props> = ({
       offData?.();
       offStarted?.();
     }, 6000);
-  };
+  }
 
   const handleRunAll = async () => {
     const msg = prompt.trim();
@@ -511,7 +577,7 @@ const MultiAgentTask: React.FC<Props> = ({
     // Send concurrently via PTY injection for all agents (Codex/Claude included)
     const tasks: Promise<any>[] = [];
     variants.forEach((v) => {
-      const termId = `${v.worktreeId}-main`;
+      const termId = getVariantTerminalId(v);
       tasks.push(injectPrompt(termId, v.agent, msg));
     });
     await Promise.all(tasks);
@@ -592,8 +658,8 @@ const MultiAgentTask: React.FC<Props> = ({
 
     variants.forEach((variant) => {
       const variantId = variant.worktreeId;
-      const ptyId = `${variant.worktreeId}-main`;
-      busyState.set(variantId, variantBusy[variantId] ?? false);
+      const ptyId = getVariantTerminalId(variant);
+      busyState.set(variantId, false);
 
       const offData = (window as any).electronAPI?.onPtyData?.(ptyId, (chunk: string) => {
         try {
@@ -624,8 +690,7 @@ const MultiAgentTask: React.FC<Props> = ({
       busySince.clear();
       busyState.clear();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [variants]);
+  }, [variants, getVariantTerminalId]);
 
   // Prefill the top input with the prepared issue context once
   const prefillOnceRef = useRef(false);
@@ -720,6 +785,19 @@ const MultiAgentTask: React.FC<Props> = ({
       {variants.map((v, idx) => {
         const isDark = effectiveTheme === 'dark' || effectiveTheme === 'dark-black';
         const isActive = idx === activeTabIndex;
+        const selectedSessionConversationId = variantSessionConversationIds[v.worktreeId] || null;
+        const stepSessionOptions =
+          isActive && activeWorkflow
+            ? activeWorkflow.steps
+                .filter((step) => Boolean(step.conversationId))
+                .sort((a, b) => a.number - b.number)
+                .map((step) => ({
+                  stepId: step.id,
+                  number: step.number,
+                  title: step.title,
+                  conversationId: step.conversationId as string,
+                }))
+            : [];
         return (
           <div
             key={v.worktreeId}
@@ -809,6 +887,47 @@ const MultiAgentTask: React.FC<Props> = ({
                         >
                           Init All Agents
                         </Button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                        <span className="text-muted-foreground">Sessions:</span>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={selectedSessionConversationId ? 'outline' : 'secondary'}
+                          disabled={workflowBusy}
+                          onClick={() =>
+                            setVariantSessionConversationIds((prev) => ({
+                              ...prev,
+                              [v.worktreeId]: null,
+                            }))
+                          }
+                          className="h-6 px-2 text-xs"
+                        >
+                          Main
+                        </Button>
+                        {stepSessionOptions.map((session) => (
+                          <Button
+                            key={session.stepId}
+                            type="button"
+                            size="sm"
+                            variant={
+                              selectedSessionConversationId === session.conversationId
+                                ? 'secondary'
+                                : 'outline'
+                            }
+                            disabled={workflowBusy}
+                            onClick={() =>
+                              setVariantSessionConversationIds((prev) => ({
+                                ...prev,
+                                [v.worktreeId]: session.conversationId,
+                              }))
+                            }
+                            className="h-6 px-2 text-xs"
+                            title={`Step ${session.number}: ${session.title}`}
+                          >
+                            Step {session.number}
+                          </Button>
+                        ))}
                       </div>
                       <div className="space-y-1">
                         {activeWorkflow.steps
@@ -968,7 +1087,7 @@ const MultiAgentTask: React.FC<Props> = ({
                 >
                   <TerminalPane
                     ref={isActive ? activeTerminalRef : undefined}
-                    id={`${v.worktreeId}-main`}
+                    id={getVariantTerminalId(v)}
                     cwd={v.path}
                     remote={
                       projectRemoteConnectionId
@@ -1020,7 +1139,7 @@ const MultiAgentTask: React.FC<Props> = ({
                         (agentMeta[v.agent]?.initialPromptFlag === undefined ||
                           agentMeta[v.agent]?.useKeystrokeInjection)
                       ) {
-                        void injectPrompt(`${v.worktreeId}-main`, v.agent, initialInjection);
+                        void injectPrompt(getVariantTerminalId(v), v.agent, initialInjection);
                       }
                       // Mark initial injection as sent so it won't re-run on restart
                       if (initialInjection && !task.metadata?.initialInjectionSent) {
