@@ -75,7 +75,7 @@ describe('WorkflowService scoped plans', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('stores scoped workflows under .zenflow/<taskId>/<scope>/plan.md', async () => {
+  it('stores scoped workflows under .emdash/<taskId>/<scope>/plan.md', async () => {
     const workflow = await service.createWorkflow({
       taskId: storedTask.id,
       template: 'spec-and-build',
@@ -84,8 +84,8 @@ describe('WorkflowService scoped plans', () => {
     });
 
     expect(workflow.scopeKey).toBe('codex');
-    expect(workflow.planRelPath).toBe('.zenflow/task-agent-scope/codex/plan.md');
-    expect(workflow.artifactsDirRelPath).toBe('.zenflow/task-agent-scope/codex');
+    expect(workflow.planRelPath).toBe('.emdash/task-agent-scope/codex/plan.md');
+    expect(workflow.artifactsDirRelPath).toBe('.emdash/task-agent-scope/codex');
     expect(fs.existsSync(path.join(tmpDir, workflow.planRelPath))).toBe(true);
 
     const metadata = storedTask.metadata as Record<string, any>;
@@ -107,7 +107,7 @@ describe('WorkflowService scoped plans', () => {
       scopeKey: 'claude',
     });
 
-    const codexPlanPath = path.join(tmpDir, '.zenflow/task-agent-scope/codex/plan.md');
+    const codexPlanPath = path.join(tmpDir, '.emdash/task-agent-scope/codex/plan.md');
     const originalCodexPlan = fs.readFileSync(codexPlanPath, 'utf8');
     const mutatedCodexPlan = originalCodexPlan.replace(
       'Step 1: Technical Spec',
@@ -120,8 +120,8 @@ describe('WorkflowService scoped plans', () => {
 
     expect(codexWorkflow?.steps[0]?.title).toBe('Codex Custom Spec');
     expect(claudeWorkflow?.steps[0]?.title).toBe('Technical Spec');
-    expect(codexWorkflow?.planRelPath).toBe('.zenflow/task-agent-scope/codex/plan.md');
-    expect(claudeWorkflow?.planRelPath).toBe('.zenflow/task-agent-scope/claude/plan.md');
+    expect(codexWorkflow?.planRelPath).toBe('.emdash/task-agent-scope/codex/plan.md');
+    expect(claudeWorkflow?.planRelPath).toBe('.emdash/task-agent-scope/claude/plan.md');
   });
 
   it('supports simple-prompt template and taskPathOverride', async () => {
@@ -138,10 +138,34 @@ describe('WorkflowService scoped plans', () => {
       expect(workflow.steps).toHaveLength(1);
       expect(workflow.steps[0]?.title).toBe('Implementation');
 
-      const planPath = path.join(overrideDir, '.zenflow/task-agent-scope/codex-main-123/plan.md');
+      const planPath = path.join(overrideDir, '.emdash/task-agent-scope/codex-main-123/plan.md');
       expect(fs.existsSync(planPath)).toBe(true);
     } finally {
       fs.rmSync(overrideDir, { recursive: true, force: true });
     }
+  });
+
+  it('keeps long scope keys distinct without truncation collisions', async () => {
+    const base = `agent-${'a'.repeat(90)}`;
+    const scopeA = `${base}-one`;
+    const scopeB = `${base}-two`;
+
+    const wfA = await service.createWorkflow({
+      taskId: storedTask.id,
+      template: 'simple-prompt',
+      featureDescription: 'Long scope A',
+      scopeKey: scopeA,
+    });
+    const wfB = await service.createWorkflow({
+      taskId: storedTask.id,
+      template: 'simple-prompt',
+      featureDescription: 'Long scope B',
+      scopeKey: scopeB,
+    });
+
+    expect(wfA.scopeKey).not.toBe(wfB.scopeKey);
+    expect(wfA.planRelPath).not.toBe(wfB.planRelPath);
+    expect(fs.existsSync(path.join(tmpDir, wfA.planRelPath))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, wfB.planRelPath))).toBe(true);
   });
 });

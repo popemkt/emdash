@@ -10,7 +10,7 @@ import type {
   WorkflowTemplate,
 } from '@shared/workflow/types';
 
-const WORKFLOW_ROOT_REL = '.zenflow';
+const WORKFLOW_ROOT_REL = '.emdash';
 const CHAT_ID_COMMENT = /^\s*<!--\s*emdash:chat-id=(.*?)\s*-->\s*$/;
 const STEP_ID_COMMENT = /^\s*<!--\s*emdash:step-id=(.*?)\s*-->\s*$/;
 const PAUSE_COMMENT = /^\s*<!--\s*emdash:pause-point=(true|false)\s*-->\s*$/;
@@ -137,6 +137,15 @@ function isWorkflowState(value: unknown): value is WorkflowState {
 
 function normalizeScopeKey(scopeKey?: string): string {
   const input = typeof scopeKey === 'string' ? scopeKey.trim() : '';
+  const normalized = (input || DEFAULT_SCOPE_KEY)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || DEFAULT_SCOPE_KEY;
+}
+
+function normalizeLegacyScopeKey(scopeKey?: string): string {
+  const input = typeof scopeKey === 'string' ? scopeKey.trim() : '';
   const normalized = slugify(input || DEFAULT_SCOPE_KEY);
   return normalized || DEFAULT_SCOPE_KEY;
 }
@@ -180,6 +189,8 @@ export class WorkflowService {
     const normalizedScope = normalizeScopeKey(scopeKey);
     const workflows = this.getWorkflowStorage(task);
     if (workflows[normalizedScope]) return workflows[normalizedScope];
+    const legacyScope = normalizeLegacyScopeKey(scopeKey);
+    if (legacyScope !== normalizedScope && workflows[legacyScope]) return workflows[legacyScope];
 
     // Backward compatibility for early workflow metadata shape.
     if (normalizedScope === DEFAULT_SCOPE_KEY && isWorkflowState(task.metadata?.workflow)) {
@@ -199,11 +210,15 @@ export class WorkflowService {
 
   private withWorkflowMetadata(task: Task, scopeKey: string, workflow: WorkflowState): Task {
     const normalizedScope = normalizeScopeKey(scopeKey);
+    const legacyScope = normalizeLegacyScopeKey(scopeKey);
     const existing = this.getWorkflowStorage(task);
     const nextStorage: WorkflowStorage = {
       ...existing,
       [normalizedScope]: workflow,
     };
+    if (legacyScope !== normalizedScope && legacyScope in nextStorage) {
+      delete nextStorage[legacyScope];
+    }
 
     const metadata = {
       ...(task.metadata || {}),
