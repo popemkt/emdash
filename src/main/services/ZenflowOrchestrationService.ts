@@ -121,7 +121,11 @@ class ZenflowOrchestrationService extends EventEmitter {
     // Snapshot initial step statuses for transition detection
     zenflowPlanService.snapshotStatuses(args.taskId, planSteps);
 
-    return savedSteps;
+    // Auto-start step 1 so it's in 'running' state when the UI loads
+    await this.startStep(args.taskId, savedSteps[0].id);
+
+    // Re-read steps to return up-to-date state
+    return databaseService.getWorkflowSteps(args.taskId);
   }
 
   /**

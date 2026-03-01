@@ -463,75 +463,56 @@ export async function createTask(
           : null
       );
 
-      // Set the active task and its agent
+      // Initialize zenflow workflow BEFORE activating the task in the UI.
+      // This ensures step 1's conversation exists when ChatInterface mounts,
+      // preventing it from creating a spurious default conversation.
+      if (params.zenflow?.enabled) {
+        try {
+          const zenflowResult = await window.electronAPI.zenflowCreateWorkflow({
+            taskId: newTask.id,
+            template: params.zenflow.template,
+            featureDescription: params.zenflow.featureDescription,
+            worktreePath: newTask.path,
+          });
+          if (zenflowResult.success) {
+            const steps = zenflowResult.data ?? [];
+            const zenflowMeta: TaskMetadata = {
+              ...taskMetadata,
+              initialPrompt: null, // zenflow manages its own prompts per-step
+              zenflow: {
+                enabled: true,
+                template: params.zenflow.template,
+                currentStepNumber: 1,
+                totalSteps: steps.length,
+                status: 'running',
+                featureDescription: params.zenflow.featureDescription,
+                artifactsDir: '.zenflow',
+              },
+            };
+            await window.electronAPI.saveTask({
+              ...newTask,
+              metadata: zenflowMeta,
+            });
+            // Use updated task with zenflow metadata from the start
+            newTask = { ...newTask, metadata: zenflowMeta };
+          } else {
+            const { log } = await import('./logger');
+            log.error('Failed to create zenflow workflow:', zenflowResult.error);
+          }
+        } catch (error) {
+          const { log } = await import('./logger');
+          log.error('Failed to initialize zenflow workflow:', error as any);
+        }
+      }
+
+      // Set the active task and its agent — for zenflow, step 1's conversation
+      // already exists at this point so ChatInterface picks it up correctly.
       setActiveTask(newTask);
       setActiveTaskAgent(getAgentForTask(newTask) ?? primaryAgent ?? 'codex');
       saveActiveIds(newTask.projectId, newTask.id);
 
       // Run setup after task creation (non-blocking).
       void runSetupOnCreate(newTask.id, newTask.path, selectedProject.path, newTask.name);
-
-      // Initialize zenflow workflow if enabled
-      if (params.zenflow?.enabled) {
-        (async () => {
-          try {
-            const zenflowResult = await window.electronAPI.zenflowCreateWorkflow({
-              taskId: newTask.id,
-              template: params.zenflow!.template,
-              featureDescription: params.zenflow!.featureDescription,
-              worktreePath: newTask.path,
-            });
-            if (zenflowResult.success) {
-              // Update task metadata with zenflow config
-              const steps = zenflowResult.data ?? [];
-              const zenflowMeta: TaskMetadata = {
-                ...taskMetadata,
-                initialPrompt: null, // zenflow manages its own prompts per-step
-                zenflow: {
-                  enabled: true,
-                  template: params.zenflow!.template,
-                  currentStepNumber: 1,
-                  totalSteps: steps.length,
-                  status: 'running',
-                  featureDescription: params.zenflow!.featureDescription,
-                  artifactsDir: '.zenflow',
-                },
-              };
-              await window.electronAPI.saveTask({
-                ...newTask,
-                metadata: zenflowMeta,
-              });
-              // Update UI with zenflow metadata
-              const updatedTask = { ...newTask, metadata: zenflowMeta };
-              setProjects((prev) =>
-                prev.map((project) =>
-                  project.id === selectedProject.id
-                    ? {
-                        ...project,
-                        tasks: project.tasks?.map((t) => (t.id === newTask.id ? updatedTask : t)),
-                      }
-                    : project
-                )
-              );
-              setSelectedProject((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      tasks: prev.tasks?.map((t) => (t.id === newTask.id ? updatedTask : t)),
-                    }
-                  : null
-              );
-              setActiveTask((current) => (current?.id === newTask.id ? updatedTask : current));
-            } else {
-              const { log } = await import('./logger');
-              log.error('Failed to create zenflow workflow:', zenflowResult.error);
-            }
-          } catch (error) {
-            const { log } = await import('./logger');
-            log.error('Failed to initialize zenflow workflow:', error as any);
-          }
-        })();
-      }
 
       // Background: telemetry (non-blocking)
       import('./telemetryClient').then(({ captureTelemetry }) => {
