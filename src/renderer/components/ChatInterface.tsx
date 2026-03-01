@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
-import { Plus, X } from 'lucide-react';
+import { Check, Pause, Play, Plus, X } from 'lucide-react';
 import { useToast } from '../hooks/use-toast';
 import { useTheme } from '../hooks/useTheme';
 import { TerminalPane } from './TerminalPane';
@@ -26,6 +26,11 @@ import { type Conversation } from '../../main/services/DatabaseService';
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { makePtyId } from '@shared/ptyId';
+import { Button } from './ui/button';
+import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import TaskMessageComposer from './TaskMessageComposer';
+import { workflowStatusDotClass, workflowTemplateLabel } from '@/lib/workflowUi';
 
 declare const window: Window & {
   electronAPI: {
@@ -43,6 +48,23 @@ interface Props {
   className?: string;
   initialAgent?: Agent;
   onTaskInterfaceReady?: () => void;
+}
+
+function parseConversationMetadata(raw: string | null | undefined): Record<string, any> {
+  if (!raw || typeof raw !== 'string') return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeWorkflowScopeKey(raw: string | null | undefined): string {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!value) return 'default';
+  const normalized = value.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized || 'default';
 }
 
 const ChatInterface: React.FC<Props> = ({
@@ -74,6 +96,11 @@ const ChatInterface: React.FC<Props> = ({
   const [showDeleteChatModal, setShowDeleteChatModal] = useState(false);
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
   const [busyByConversationId, setBusyByConversationId] = useState<Record<string, boolean>>({});
+  const [messageBarPrompt, setMessageBarPrompt] = useState('');
+  const [workflowByScope, setWorkflowByScope] = useState<Record<string, WorkflowState | null>>({});
+  const [workflowLoadingByScope, setWorkflowLoadingByScope] = useState<Record<string, boolean>>({});
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowTemplate, setWorkflowTemplate] = useState<WorkflowTemplate>('simple-prompt');
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
 
@@ -81,12 +108,58 @@ const ChatInterface: React.FC<Props> = ({
     () => conversations.find((c) => c.isMain)?.id ?? null,
     [conversations]
   );
+  const activeConversation = useMemo(
+    () => conversations.find((c) => c.id === activeConversationId) ?? null,
+    [conversations, activeConversationId]
+  );
+  const activeConversationMetadata = useMemo(
+    () => parseConversationMetadata(activeConversation?.metadata),
+    [activeConversation?.metadata]
+  );
+  const workflowProvider = useMemo(
+    () => (activeConversation?.provider || agent || 'default').trim(),
+    [activeConversation?.provider, agent]
+  );
+  const workflowScopeKey = useMemo(
+    () => normalizeWorkflowScopeKey(workflowProvider),
+    [workflowProvider]
+  );
+  const hasWorkflowSnapshot = Object.prototype.hasOwnProperty.call(
+    workflowByScope,
+    workflowScopeKey
+  );
+  const workflow = hasWorkflowSnapshot ? (workflowByScope[workflowScopeKey] ?? null) : null;
+  const workflowLoading = Boolean(workflowLoadingByScope[workflowScopeKey]);
+  const showWorkflowLoadingPlaceholder = workflowLoading && !hasWorkflowSnapshot;
+  const selectedSessionConversationId = activeConversation?.isMain
+    ? null
+    : (activeConversationId ?? null);
+  const workflowSessionOptions = useMemo(
+    () =>
+      workflow
+        ? workflow.steps
+            .filter((step) => Boolean(step.conversationId))
+            .sort((a, b) => a.number - b.number)
+            .map((step) => ({
+              stepId: step.id,
+              number: step.number,
+              title: step.title,
+              conversationId: step.conversationId as string,
+            }))
+        : [],
+    [workflow]
+  );
+  const activeWorkflowStepPrompt = useMemo(() => {
+    const metadata = activeConversationMetadata.workflowStep;
+    if (!metadata || typeof metadata !== 'object') return null;
+    const prompt = typeof metadata.initialPrompt === 'string' ? metadata.initialPrompt.trim() : '';
+    if (!prompt) return null;
+    if (metadata.promptSent === true) return null;
+    return prompt;
+  }, [activeConversationMetadata]);
 
   // Update terminal ID to include conversation ID and agent - unique per conversation
   const terminalId = useMemo(() => {
-    // Find the active conversation to check if it's the main one
-    const activeConversation = conversations.find((c) => c.id === activeConversationId);
-
     if (activeConversation?.isMain) {
       // Main conversations use task-based ID for backward compatibility
       // This ensures terminal sessions persist correctly
@@ -97,7 +170,7 @@ const ChatInterface: React.FC<Props> = ({
     }
     // Fallback to main format if no active conversation
     return makePtyId(agent, 'main', task.id);
-  }, [activeConversationId, agent, task.id, conversations]);
+  }, [activeConversationId, activeConversation?.isMain, agent, task.id]);
 
   // Claude needs consistent working directory to maintain session state
   const terminalCwd = useMemo(() => {
@@ -221,6 +294,67 @@ const ChatInterface: React.FC<Props> = ({
 
     loadConversations();
   }, [task.id, task.agentId]); // provider is intentionally not included as a dependency
+
+  const reloadConversations = useCallback(async () => {
+    const result = await window.electronAPI.getConversations(task.id);
+    if (!result.success || !result.conversations || result.conversations.length === 0) return;
+    setConversations(result.conversations);
+    const active =
+      result.conversations.find((c: Conversation) => c.isActive) || result.conversations[0];
+    setActiveConversationId(active.id);
+    if (active.provider) setAgent(active.provider as Agent);
+  }, [task.id]);
+
+  const loadWorkflow = useCallback(async () => {
+    const scopeKey = workflowScopeKey;
+    setWorkflowLoadingByScope((prev) => ({
+      ...prev,
+      [scopeKey]: true,
+    }));
+    try {
+      const result = await window.electronAPI.workflowGet({
+        taskId: task.id,
+        scopeKey,
+      });
+      if (!result.success) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [scopeKey]: null,
+        }));
+        return;
+      }
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: (result.workflow as WorkflowState | null | undefined) || null,
+      }));
+    } catch {
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: null,
+      }));
+    } finally {
+      setWorkflowLoadingByScope((prev) => ({
+        ...prev,
+        [scopeKey]: false,
+      }));
+    }
+  }, [task.id, workflowScopeKey]);
+
+  useEffect(() => {
+    setWorkflowByScope({});
+    setWorkflowLoadingByScope({});
+  }, [task.id]);
+
+  useEffect(() => {
+    void loadWorkflow();
+  }, [loadWorkflow]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadWorkflow();
+    }, 2500);
+    return () => window.clearInterval(intervalId);
+  }, [loadWorkflow]);
 
   // Activity indicators per conversation tab (main PTY uses `task.id`, chat PTYs use `conversation.id`).
   useEffect(() => {
@@ -589,6 +723,171 @@ const ChatInterface: React.FC<Props> = ({
     setShowDeleteChatModal(false);
   }, [chatToDelete, conversations, agent, task.id, activeConversationId]);
 
+  const handleInitializeWorkflow = useCallback(
+    async (template: WorkflowTemplate) => {
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowCreate({
+          taskId: task.id,
+          template,
+          featureDescription: task.name,
+          scopeKey: workflowScopeKey,
+        });
+        if (!result.success || !result.workflow) {
+          throw new Error(result.error || 'Failed to initialize workflow');
+        }
+        const createdWorkflow = result.workflow;
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: createdWorkflow,
+        }));
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to initialize workflow',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, task.name, toast, workflowScopeKey]
+  );
+
+  const handleStartWorkflowStep = useCallback(
+    async (stepId: string) => {
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowStartStep({
+          taskId: task.id,
+          stepId,
+          provider: workflowProvider,
+          scopeKey: workflowScopeKey,
+        });
+        if (!result.success || !result.workflow) {
+          throw new Error(result.error || 'Failed to start step');
+        }
+        const startedWorkflow = result.workflow;
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: startedWorkflow,
+        }));
+        await reloadConversations();
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to start step',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, workflowProvider, workflowScopeKey, reloadConversations, toast]
+  );
+
+  const handleCompleteWorkflowStep = useCallback(
+    async (step: WorkflowStep) => {
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowCompleteStep({
+          taskId: task.id,
+          stepId: step.id,
+          scopeKey: workflowScopeKey,
+        });
+        if (!result.success || !result.workflow) {
+          throw new Error(result.error || 'Failed to complete step');
+        }
+
+        let nextWorkflow = result.workflow;
+        if (result.workflow.autoMode === 'auto' && !step.pausePoint) {
+          const next = await window.electronAPI.workflowNextStep({
+            taskId: task.id,
+            provider: workflowProvider,
+            scopeKey: workflowScopeKey,
+          });
+          if (next.success && next.result) {
+            nextWorkflow = next.result.workflow;
+            await reloadConversations();
+          }
+        }
+
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: nextWorkflow,
+        }));
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to complete step',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, workflowProvider, workflowScopeKey, reloadConversations, toast]
+  );
+
+  const handleNextWorkflowStep = useCallback(async () => {
+    setWorkflowBusy(true);
+    try {
+      const result = await window.electronAPI.workflowNextStep({
+        taskId: task.id,
+        provider: workflowProvider,
+        scopeKey: workflowScopeKey,
+      });
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to start next step');
+      }
+      const nextStepResult = result.result;
+      if (nextStepResult) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: nextStepResult.workflow,
+        }));
+        await reloadConversations();
+      }
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to start next step',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [task.id, workflowProvider, workflowScopeKey, reloadConversations, toast]);
+
+  const handleToggleWorkflowAuto = useCallback(async () => {
+    if (!workflow) return;
+    setWorkflowBusy(true);
+    try {
+      const nextMode = workflow.autoMode === 'auto' ? 'manual' : 'auto';
+      const result = await window.electronAPI.workflowSetAutoMode({
+        taskId: task.id,
+        autoMode: nextMode,
+        scopeKey: workflowScopeKey,
+      });
+      if (!result.success || !result.workflow) {
+        throw new Error(result.error || 'Failed to update workflow mode');
+      }
+      const updatedWorkflow = result.workflow;
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [workflowScopeKey]: updatedWorkflow,
+      }));
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to update workflow mode',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [workflow, task.id, workflowScopeKey, toast]);
+
   // Persist last-selected agent per task (including Droid)
   useEffect(() => {
     try {
@@ -850,13 +1149,27 @@ const ChatInterface: React.FC<Props> = ({
     return null;
   }, [isTerminal, isMainConversation, task.metadata, commentsContext]);
 
+  const effectiveConversationPrompt = useMemo(() => {
+    if (activeWorkflowStepPrompt) return activeWorkflowStepPrompt;
+    if (task.metadata?.initialInjectionSent) return null;
+    return initialInjection;
+  }, [activeWorkflowStepPrompt, task.metadata?.initialInjectionSent, initialInjection]);
+  const promptScopeId = activeWorkflowStepPrompt ? (activeConversationId ?? undefined) : undefined;
+  const terminalCliPrompt =
+    agentMeta[agent]?.initialPromptFlag !== undefined &&
+    !agentMeta[agent]?.useKeystrokeInjection &&
+    effectiveConversationPrompt
+      ? effectiveConversationPrompt
+      : undefined;
+
   // Only use keystroke injection for agents WITHOUT CLI flag support,
   // or agents that explicitly opt into it (useKeystrokeInjection: true).
   // Agents with initialPromptFlag use CLI arg injection via TerminalPane instead.
   useInitialPromptInjection({
     taskId: task.id,
     providerId: agent,
-    prompt: initialInjection,
+    prompt: effectiveConversationPrompt,
+    scopeId: promptScopeId,
     enabled:
       isTerminal &&
       (agentMeta[agent]?.initialPromptFlag === undefined ||
@@ -869,6 +1182,20 @@ const ChatInterface: React.FC<Props> = ({
       localStorage.setItem(`taskAgent:${task.id}`, agent);
     } catch {}
   }, [agent, task.id]);
+
+  const handleSendMessageBar = useCallback(() => {
+    const trimmed = messageBarPrompt.trim();
+    if (!trimmed || !conversationsLoaded) return;
+    try {
+      window.electronAPI.ptyInput({ id: terminalId, data: trimmed + '\r\n' });
+      window.setTimeout(() => {
+        window.electronAPI.ptyInput({ id: terminalId, data: '\r' });
+      }, 120);
+      setMessageBarPrompt('');
+    } catch (error) {
+      console.error('Failed to send message bar prompt', error);
+    }
+  }, [messageBarPrompt, conversationsLoaded, terminalId]);
 
   if (!isTerminal) {
     return null;
@@ -899,6 +1226,198 @@ const ChatInterface: React.FC<Props> = ({
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="px-6 pt-4">
             <div className="mx-auto max-w-4xl space-y-2">
+              <div className="min-h-[132px] rounded-md border border-border/70 bg-muted/30 p-2">
+                {showWorkflowLoadingPlaceholder ? (
+                  <div className="flex min-h-[116px] items-center justify-center gap-2 text-xs text-muted-foreground">
+                    <Spinner size="sm" />
+                    Loading workflow...
+                  </div>
+                ) : workflow ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-medium text-foreground">Workflow:</span>
+                      <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
+                      <Badge variant="outline">{workflowTemplateLabel(workflow.type)}</Badge>
+                      <Badge variant="secondary">{workflow.status.replace('_', ' ')}</Badge>
+                      <Badge variant="outline">{workflow.steps.length} steps</Badge>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleToggleWorkflowAuto()}
+                        disabled={workflowBusy}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        {workflow.autoMode === 'auto' ? (
+                          <>
+                            <Pause className="mr-1.5 h-3.5 w-3.5" />
+                            Auto: On
+                          </>
+                        ) : (
+                          <>
+                            <Play className="mr-1.5 h-3.5 w-3.5" />
+                            Auto: Off
+                          </>
+                        )}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleNextWorkflowStep()}
+                        disabled={workflowBusy}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Next Step
+                      </Button>
+                      <Select
+                        value={workflowTemplate}
+                        onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                      >
+                        <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent side="top" className="z-[120]">
+                          <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                          <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                          <SelectItem value="full-sdd">Full SDD</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleInitializeWorkflow(workflowTemplate)}
+                        disabled={workflowBusy}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Re-init Active
+                      </Button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                      <span className="text-muted-foreground">Sessions:</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={!selectedSessionConversationId ? 'secondary' : 'outline'}
+                        onClick={() => {
+                          if (mainConversationId) {
+                            void handleSwitchChat(mainConversationId);
+                          }
+                        }}
+                        disabled={workflowBusy || !mainConversationId}
+                        className="h-6 px-2 text-xs"
+                      >
+                        Main
+                      </Button>
+                      {workflowSessionOptions.map((session) => (
+                        <Button
+                          key={session.stepId}
+                          type="button"
+                          size="sm"
+                          variant={
+                            selectedSessionConversationId === session.conversationId
+                              ? 'secondary'
+                              : 'outline'
+                          }
+                          onClick={() => void handleSwitchChat(session.conversationId)}
+                          disabled={workflowBusy}
+                          className="h-6 px-2 text-xs"
+                          title={`Step ${session.number}: ${session.title}`}
+                        >
+                          Step {session.number}
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="space-y-1">
+                      {workflow.steps
+                        .slice()
+                        .sort((a, b) => a.number - b.number)
+                        .map((step) => {
+                          const isCurrent = workflow.currentStepId === step.id;
+                          return (
+                            <div
+                              key={step.id}
+                              className={cn(
+                                'flex flex-wrap items-center gap-2 rounded border border-border/60 bg-background px-2 py-1 text-xs',
+                                isCurrent && 'border-foreground/30'
+                              )}
+                            >
+                              <span
+                                className={cn(
+                                  'h-2 w-2 rounded-full',
+                                  workflowStatusDotClass(step.status)
+                                )}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => void handleStartWorkflowStep(step.id)}
+                                disabled={workflowBusy}
+                                className="font-medium text-foreground hover:underline disabled:no-underline disabled:opacity-70"
+                              >
+                                Step {step.number}: {step.title}
+                              </button>
+                              {step.pausePoint ? (
+                                <span className="text-muted-foreground">(pause)</span>
+                              ) : null}
+                              <span className="text-muted-foreground">
+                                chat:{' '}
+                                {step.conversationId ? (
+                                  <code>{step.conversationId}</code>
+                                ) : (
+                                  <code>none</code>
+                                )}
+                              </span>
+                              {step.status !== 'completed' ? (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => void handleCompleteWorkflowStep(step)}
+                                  disabled={workflowBusy || step.status === 'pending'}
+                                  className="ml-auto h-6 px-2 text-xs"
+                                >
+                                  <Check className="mr-1 h-3 w-3" />
+                                  Complete
+                                </Button>
+                              ) : (
+                                <span className="ml-auto text-green-600">done</span>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-medium text-foreground">Workflow:</span>
+                    <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
+                    <Select
+                      value={workflowTemplate}
+                      onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                    >
+                      <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent side="top" className="z-[120]">
+                        <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                        <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                        <SelectItem value="full-sdd">Full SDD</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleInitializeWorkflow(workflowTemplate)}
+                      disabled={workflowBusy}
+                      className="h-7 px-2.5 text-xs"
+                    >
+                      Init Active
+                    </Button>
+                  </div>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <div
                   ref={tabsContainerRef}
@@ -1088,16 +1607,40 @@ const ChatInterface: React.FC<Props> = ({
                   }}
                   onStartSuccess={() => {
                     setCliStartError(null);
-                    // Mark initial injection as sent so it won't re-run on restart
-                    if (initialInjection && !task.metadata?.initialInjectionSent) {
-                      void window.electronAPI.saveTask({
-                        ...task,
-                        metadata: {
-                          ...task.metadata,
-                          initialInjectionSent: true,
-                        },
-                      });
-                    }
+                    void (async () => {
+                      // Mark main task injection as sent so it won't re-run on restart.
+                      if (
+                        isMainConversation &&
+                        initialInjection &&
+                        !task.metadata?.initialInjectionSent
+                      ) {
+                        await window.electronAPI.saveTask({
+                          ...task,
+                          metadata: {
+                            ...task.metadata,
+                            initialInjectionSent: true,
+                          },
+                        });
+                      }
+
+                      // Mark workflow step prompt as sent on this conversation.
+                      if (activeConversation && activeWorkflowStepPrompt) {
+                        const metadata = parseConversationMetadata(activeConversation.metadata);
+                        if (metadata.workflowStep && metadata.workflowStep.promptSent !== true) {
+                          metadata.workflowStep.promptSent = true;
+                          const nextConversation = {
+                            ...activeConversation,
+                            metadata: JSON.stringify(metadata),
+                          };
+                          await window.electronAPI.saveConversation(nextConversation);
+                          setConversations((prev) =>
+                            prev.map((conv) =>
+                              conv.id === activeConversation.id ? nextConversation : conv
+                            )
+                          );
+                        }
+                      }
+                    })();
                   }}
                   variant={
                     effectiveTheme === 'dark' || effectiveTheme === 'dark-black' ? 'dark' : 'light'
@@ -1140,16 +1683,23 @@ const ChatInterface: React.FC<Props> = ({
                       ? 'invert(1) hue-rotate(180deg) brightness(1.1) contrast(1.05)'
                       : undefined
                   }
-                  initialPrompt={
-                    agentMeta[agent]?.initialPromptFlag !== undefined &&
-                    !agentMeta[agent]?.useKeystrokeInjection &&
-                    !task.metadata?.initialInjectionSent
-                      ? (initialInjection ?? undefined)
-                      : undefined
-                  }
+                  initialPrompt={terminalCliPrompt}
                   className="h-full w-full"
                 />
               )}
+            </div>
+          </div>
+          <div className="px-6 pb-6 pt-4">
+            <div className="mx-auto max-w-4xl">
+              <TaskMessageComposer
+                value={messageBarPrompt}
+                onValueChange={setMessageBarPrompt}
+                onSubmit={handleSendMessageBar}
+                placeholder="Send a message to this agent..."
+                disabled={!conversationsLoaded}
+                submitTitle="Send to active chat (Enter)"
+                submitAriaLabel="Send to active chat"
+              />
             </div>
           </div>
         </div>

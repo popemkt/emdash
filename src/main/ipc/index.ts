@@ -23,6 +23,7 @@ import { registerNetIpc } from './netIpc';
 import { registerLineCommentsIpc } from './lineCommentsIpc';
 import { registerSshIpc } from './sshIpc';
 import { registerSkillsIpc } from './skillsIpc';
+import { registerWorkflowIpc } from './workflowIpc';
 
 export function registerAllIpc() {
   // Core app/utility IPC
@@ -42,6 +43,7 @@ export function registerAllIpc() {
   registerBrowserIpc();
   registerNetIpc();
   registerLineCommentsIpc();
+  registerWorkflowIpc();
 
   // Existing modules
   registerPtyIpc();

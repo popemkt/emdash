@@ -6,10 +6,12 @@ import { type JiraIssueSummary } from '../types/jira';
 import { type LinearIssueSummary } from '../types/linear';
 import { saveActiveIds } from '../constants/layout';
 import { getAgentForTask } from './getAgentForTask';
+import type { WorkflowTemplate } from '@shared/workflow/types';
 
 export interface CreateTaskParams {
   taskName: string;
   initialPrompt?: string;
+  initialPromptWorkflow?: WorkflowTemplate;
   agentRuns: AgentRun[];
   linkedLinearIssue: LinearIssueSummary | null;
   linkedGithubIssue: GitHubIssueSummary | null;
@@ -59,6 +61,7 @@ export async function createTask(
   const {
     taskName,
     initialPrompt,
+    initialPromptWorkflow,
     agentRuns,
     linkedLinearIssue,
     linkedGithubIssue,
@@ -103,6 +106,7 @@ export async function createTask(
             jiraIssue: linkedJiraIssue ?? null,
             githubIssue: linkedGithubIssue ?? null,
             initialPrompt: preparedPrompt ?? null,
+            initialPromptWorkflow: initialPromptWorkflow ?? null,
             autoApprove: autoApprove ?? null,
           }
         : null;
@@ -296,6 +300,33 @@ export async function createTask(
           );
           setActiveTask((current) => (current?.id === groupId ? finalTask : current));
 
+          if (initialPromptWorkflow) {
+            const getScopeKey = (variant: {
+              worktreeId?: string;
+              id?: string;
+              agent?: string;
+            }): string =>
+              ((variant.worktreeId || variant.id || variant.agent || 'default') as string)
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-+|-+$/g, '') || 'default';
+
+            const featureDescription = preparedPrompt?.trim() || initialPrompt?.trim() || taskName;
+
+            await Promise.all(
+              variants.map((variant) =>
+                window.electronAPI.workflowCreate({
+                  taskId: finalTask.id,
+                  template: initialPromptWorkflow,
+                  featureDescription,
+                  scopeKey: getScopeKey(variant),
+                  taskPathOverride: variant.path,
+                })
+              )
+            );
+          }
+
           // Run setup once per created variant worktree.
           for (const variant of variants) {
             void runSetupOnCreate(
@@ -339,6 +370,7 @@ export async function createTask(
         if (linkedLinearIssue) captureTelemetry('task_created_with_issue', { source: 'linear' });
         if (linkedJiraIssue) captureTelemetry('task_created_with_issue', { source: 'jira' });
       });
+
       return true;
     } else {
       let branch: string;
@@ -477,6 +509,30 @@ export async function createTask(
         if (linkedLinearIssue) captureTelemetry('task_created_with_issue', { source: 'linear' });
         if (linkedJiraIssue) captureTelemetry('task_created_with_issue', { source: 'jira' });
       });
+
+      if (initialPromptWorkflow) {
+        const scopeKey =
+          (primaryAgent || 'default')
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'default';
+        const featureDescription = preparedPrompt?.trim() || initialPrompt?.trim() || taskName;
+        void (async () => {
+          try {
+            await window.electronAPI.workflowCreate({
+              taskId: newTask.id,
+              template: initialPromptWorkflow,
+              featureDescription,
+              scopeKey,
+              taskPathOverride: path,
+            });
+          } catch (error) {
+            const { log } = await import('./logger');
+            log.warn('Failed to initialize workflow for task', error as any);
+          }
+        })();
+      }
 
       // Background: seed conversation with issue context (non-blocking)
       // This runs after modal closes so user sees task immediately

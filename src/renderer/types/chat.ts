@@ -1,4 +1,5 @@
 import type { ProviderId } from '@shared/providers/registry';
+import type { WorkflowState, WorkflowTemplate } from '@shared/workflow/types';
 import { type LinearIssueSummary } from './linear';
 import { type GitHubIssueSummary } from './github';
 import { type JiraIssueSummary } from './jira';
@@ -20,6 +21,7 @@ export interface TaskMetadata {
   githubIssue?: GitHubIssueSummary | null;
   jiraIssue?: JiraIssueSummary | null;
   initialPrompt?: string | null;
+  initialPromptWorkflow?: WorkflowTemplate | null;
   autoApprove?: boolean | null;
   /** Set to true after the initial injection (prompt/issue) has been sent to the agent */
   initialInjectionSent?: boolean | null;
@@ -42,6 +44,8 @@ export interface TaskMetadata {
     }>;
     selectedAgent?: ProviderId | null;
   } | null;
+  workflows?: Record<string, WorkflowState> | null;
+  workflow?: WorkflowState | null;
 }
 
 export interface Task {

@@ -32,6 +32,7 @@ import type { GitHubIssueSummary } from './types/github';
 import type { JiraIssueSummary } from './types/jira';
 import type { AgentRun } from './types/chat';
 import type { Project } from './types/app';
+import type { WorkflowTemplate } from '@shared/workflow/types';
 
 // Extracted hooks
 import { useModalState } from './hooks/useModalState';
@@ -324,6 +325,7 @@ const AppContent: React.FC = () => {
     async (
       taskName: string,
       initialPrompt?: string,
+      initialPromptWorkflow?: WorkflowTemplate,
       agentRuns: AgentRun[] = [{ agent: 'claude', runs: 1 }],
       linkedLinearIssue: LinearIssueSummary | null = null,
       linkedGithubIssue: GitHubIssueSummary | null = null,
@@ -338,6 +340,7 @@ const AppContent: React.FC = () => {
         {
           taskName,
           initialPrompt,
+          initialPromptWorkflow,
           agentRuns,
           linkedLinearIssue,
           linkedGithubIssue,

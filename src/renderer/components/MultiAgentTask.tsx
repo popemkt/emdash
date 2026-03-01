@@ -1,22 +1,29 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { type Task } from '../types/chat';
 import { type Agent } from '../types';
 import { Button } from './ui/button';
-import { Input } from './ui/input';
+import { Badge } from './ui/badge';
 import OpenInMenu from './titlebar/OpenInMenu';
 import { TerminalPane } from './TerminalPane';
 import { agentMeta } from '@/providers/meta';
 import { agentAssets } from '@/providers/assets';
 import AgentLogo from './AgentLogo';
 import { useTheme } from '@/hooks/useTheme';
+import { useToast } from '@/hooks/use-toast';
 import { classifyActivity } from '@/lib/activityClassifier';
 import { activityStore } from '@/lib/activityStore';
 import { Spinner } from './ui/spinner';
 import { BUSY_HOLD_MS, CLEAR_BUSY_MS, INJECT_ENTER_DELAY_MS } from '@/lib/activityConstants';
-import { CornerDownLeft } from 'lucide-react';
+import { Check, Pause, Play } from 'lucide-react';
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { getTaskEnvVars } from '@shared/task/envVars';
+import { makePtyId } from '@shared/ptyId';
+import type { ProviderId } from '@shared/providers/registry';
+import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
+import TaskMessageComposer from './TaskMessageComposer';
+import { workflowStatusDotClass, workflowTemplateLabel } from '@/lib/workflowUi';
 
 interface Props {
   task: Task;
@@ -38,6 +45,25 @@ type Variant = {
   worktreeId: string;
 };
 
+function normalizeWorkflowScopeKey(raw: string | null | undefined): string {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!value) return 'default';
+  const normalized = value.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized || 'default';
+}
+
+function getVariantWorkflowScope(variant: Variant): string {
+  return normalizeWorkflowScopeKey(variant.worktreeId || variant.id || variant.agent);
+}
+
+function getVariantMainPtyId(variant: Variant): string {
+  return makePtyId(variant.agent as ProviderId, 'main', variant.worktreeId);
+}
+
+function getVariantChatPtyId(variant: Variant, conversationId: string): string {
+  return makePtyId(variant.agent as ProviderId, 'chat', conversationId);
+}
+
 const MultiAgentTask: React.FC<Props> = ({
   task,
   projectPath,
@@ -47,11 +73,37 @@ const MultiAgentTask: React.FC<Props> = ({
   onTaskInterfaceReady,
 }) => {
   const { effectiveTheme } = useTheme();
+  const { toast } = useToast();
   const [prompt, setPrompt] = useState('');
+  const [promptTarget, setPromptTarget] = useState<'active' | 'all'>('all');
   const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [variantBusy, setVariantBusy] = useState<Record<string, boolean>>({});
+  const [workflowByScope, setWorkflowByScope] = useState<Record<string, WorkflowState | null>>({});
+  const [workflowLoadingByScope, setWorkflowLoadingByScope] = useState<Record<string, boolean>>({});
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowTemplate, setWorkflowTemplate] = useState<WorkflowTemplate>('simple-prompt');
+  const [variantSessionConversationIds, setVariantSessionConversationIds] = useState<
+    Record<string, string | null>
+  >({});
   const multi = task.metadata?.multiAgent;
   const variants = (multi?.variants || []) as Variant[];
+  const activeVariant = variants[activeTabIndex] || null;
+  const activeWorkflowScope = activeVariant ? getVariantWorkflowScope(activeVariant) : null;
+  const hasActiveWorkflowSnapshot = activeWorkflowScope
+    ? Object.prototype.hasOwnProperty.call(workflowByScope, activeWorkflowScope)
+    : false;
+  const activeWorkflow =
+    activeWorkflowScope && hasActiveWorkflowSnapshot ? workflowByScope[activeWorkflowScope] : null;
+  const getVariantTerminalId = useCallback(
+    (variant: Variant) => {
+      const conversationId = variantSessionConversationIds[variant.worktreeId];
+      if (conversationId) {
+        return getVariantChatPtyId(variant, conversationId);
+      }
+      return getVariantMainPtyId(variant);
+    },
+    [variantSessionConversationIds]
+  );
 
   const variantEnvs = useMemo(() => {
     if (!projectPath) return new Map<string, Record<string, string>>();
@@ -85,6 +137,34 @@ const MultiAgentTask: React.FC<Props> = ({
     onTaskInterfaceReady();
   }, [task.id, variants.length, onTaskInterfaceReady]);
 
+  useEffect(() => {
+    setVariantSessionConversationIds((prev) => {
+      const next: Record<string, string | null> = {};
+      for (const variant of variants) {
+        next[variant.worktreeId] = prev[variant.worktreeId] ?? null;
+      }
+      return next;
+    });
+    setWorkflowByScope((prev) => {
+      const next: Record<string, WorkflowState | null> = {};
+      for (const variant of variants) {
+        const scopeKey = getVariantWorkflowScope(variant);
+        if (Object.prototype.hasOwnProperty.call(prev, scopeKey)) {
+          next[scopeKey] = prev[scopeKey] ?? null;
+        }
+      }
+      return next;
+    });
+    setWorkflowLoadingByScope((prev) => {
+      const next: Record<string, boolean> = {};
+      for (const variant of variants) {
+        const scopeKey = getVariantWorkflowScope(variant);
+        next[scopeKey] = prev[scopeKey] ?? false;
+      }
+      return next;
+    });
+  }, [variants]);
+
   // Helper to generate display label with instance number if needed
   const getVariantDisplayLabel = (variant: Variant): string => {
     const meta = agentMeta[variant.agent];
@@ -105,6 +185,292 @@ const MultiAgentTask: React.FC<Props> = ({
 
     return `${baseName} #${instanceNum}`;
   };
+
+  const loadActiveWorkflow = useCallback(async () => {
+    if (!activeVariant || !activeWorkflowScope) {
+      return;
+    }
+    const scopeKey = activeWorkflowScope;
+    const taskPathOverride = activeVariant.path;
+    setWorkflowLoadingByScope((prev) => ({
+      ...prev,
+      [scopeKey]: true,
+    }));
+
+    try {
+      const result = await window.electronAPI.workflowGet({
+        taskId: task.id,
+        scopeKey,
+        taskPathOverride,
+      });
+      if (!result.success) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [scopeKey]: null,
+        }));
+        return;
+      }
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: (result.workflow as WorkflowState | null | undefined) || null,
+      }));
+    } catch {
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: null,
+      }));
+    } finally {
+      setWorkflowLoadingByScope((prev) => ({
+        ...prev,
+        [scopeKey]: false,
+      }));
+    }
+  }, [task.id, activeVariant, activeWorkflowScope]);
+
+  useEffect(() => {
+    void loadActiveWorkflow();
+  }, [loadActiveWorkflow]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadActiveWorkflow();
+    }, 2500);
+    return () => window.clearInterval(intervalId);
+  }, [loadActiveWorkflow]);
+
+  const initializeWorkflowForVariant = useCallback(
+    async (variant: Variant, template: WorkflowTemplate) => {
+      const scopeKey = getVariantWorkflowScope(variant);
+      const result = await window.electronAPI.workflowCreate({
+        taskId: task.id,
+        template,
+        featureDescription:
+          (task.metadata?.initialPrompt as string | undefined)?.trim() || task.name,
+        scopeKey,
+        taskPathOverride: variant.path,
+      });
+      const createdWorkflow = result.workflow;
+      if (!result.success || !createdWorkflow) {
+        throw new Error(result.error || 'Failed to initialize workflow');
+      }
+      setVariantSessionConversationIds((prev) => ({
+        ...prev,
+        [variant.worktreeId]: null,
+      }));
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: createdWorkflow,
+      }));
+      setWorkflowLoadingByScope((prev) => ({
+        ...prev,
+        [scopeKey]: false,
+      }));
+    },
+    [task.id, task.name, task.metadata?.initialPrompt]
+  );
+
+  const handleInitWorkflowForActive = useCallback(async () => {
+    if (!activeVariant) return;
+    setWorkflowBusy(true);
+    try {
+      await initializeWorkflowForVariant(activeVariant, workflowTemplate);
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to initialize workflow',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [activeVariant, initializeWorkflowForVariant, workflowTemplate, toast]);
+
+  const handleInitWorkflowForAll = useCallback(async () => {
+    if (variants.length === 0) return;
+    setWorkflowBusy(true);
+    try {
+      const orderedVariants = activeVariant
+        ? [
+            activeVariant,
+            ...variants.filter((variant) => variant.worktreeId !== activeVariant.worktreeId),
+          ]
+        : variants;
+      const results = await Promise.allSettled(
+        orderedVariants.map((variant) => initializeWorkflowForVariant(variant, workflowTemplate))
+      );
+      const failed = results.filter(
+        (result) => result.status === 'rejected'
+      ) as PromiseRejectedResult[];
+      if (failed.length > 0) {
+        throw new Error(failed[0]?.reason?.message || 'Failed to initialize one or more workflows');
+      }
+      await loadActiveWorkflow();
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to initialize workflows',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [
+    variants,
+    activeVariant,
+    initializeWorkflowForVariant,
+    workflowTemplate,
+    loadActiveWorkflow,
+    toast,
+  ]);
+
+  const handleStartWorkflowStep = useCallback(
+    async (stepId: string) => {
+      if (!activeVariant || !activeWorkflowScope) return;
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowStartStep({
+          taskId: task.id,
+          stepId,
+          provider: activeVariant.agent,
+          scopeKey: activeWorkflowScope,
+          taskPathOverride: activeVariant.path,
+        });
+        const startedWorkflow = result.workflow;
+        if (!result.success || !startedWorkflow) {
+          throw new Error(result.error || 'Failed to start step');
+        }
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [activeWorkflowScope]: startedWorkflow,
+        }));
+        if (result.conversationId) {
+          setVariantSessionConversationIds((prev) => ({
+            ...prev,
+            [activeVariant.worktreeId]: result.conversationId || null,
+          }));
+          if (result.prompt) {
+            const ptyId = getVariantChatPtyId(activeVariant, result.conversationId);
+            void injectPrompt(ptyId, activeVariant.agent, result.prompt);
+          }
+        }
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to start step',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, activeVariant, activeWorkflowScope, toast]
+  );
+
+  const handleCompleteWorkflowStep = useCallback(
+    async (step: WorkflowStep) => {
+      if (!activeVariant || !activeWorkflowScope) return;
+      setWorkflowBusy(true);
+      try {
+        const result = await window.electronAPI.workflowCompleteStep({
+          taskId: task.id,
+          stepId: step.id,
+          scopeKey: activeWorkflowScope,
+          taskPathOverride: activeVariant.path,
+        });
+        if (!result.success || !result.workflow) {
+          throw new Error(result.error || 'Failed to complete step');
+        }
+
+        let nextWorkflow = result.workflow;
+        if (result.workflow.autoMode === 'auto' && !step.pausePoint) {
+          const next = await window.electronAPI.workflowNextStep({
+            taskId: task.id,
+            provider: activeVariant.agent,
+            scopeKey: activeWorkflowScope,
+            taskPathOverride: activeVariant.path,
+          });
+          if (next.success && next.result) {
+            nextWorkflow = next.result.workflow;
+          }
+        }
+
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [activeWorkflowScope]: nextWorkflow,
+        }));
+      } catch (error) {
+        toast({
+          title: 'Workflow Error',
+          description: error instanceof Error ? error.message : 'Failed to complete step',
+          variant: 'destructive',
+        });
+      } finally {
+        setWorkflowBusy(false);
+      }
+    },
+    [task.id, activeVariant, activeWorkflowScope, toast]
+  );
+
+  const handleNextWorkflowStep = useCallback(async () => {
+    if (!activeVariant || !activeWorkflowScope) return;
+    setWorkflowBusy(true);
+    try {
+      const result = await window.electronAPI.workflowNextStep({
+        taskId: task.id,
+        provider: activeVariant.agent,
+        scopeKey: activeWorkflowScope,
+        taskPathOverride: activeVariant.path,
+      });
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to start next step');
+      }
+      const nextStepResult = result.result;
+      if (nextStepResult) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [activeWorkflowScope]: nextStepResult.workflow,
+        }));
+      }
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to start next step',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [task.id, activeVariant, activeWorkflowScope, toast]);
+
+  const handleToggleWorkflowAuto = useCallback(async () => {
+    if (!activeWorkflow || !activeVariant || !activeWorkflowScope) return;
+    setWorkflowBusy(true);
+    try {
+      const nextMode = activeWorkflow.autoMode === 'auto' ? 'manual' : 'auto';
+      const result = await window.electronAPI.workflowSetAutoMode({
+        taskId: task.id,
+        autoMode: nextMode,
+        scopeKey: activeWorkflowScope,
+        taskPathOverride: activeVariant.path,
+      });
+      const updatedWorkflow = result.workflow;
+      if (!result.success || !updatedWorkflow) {
+        throw new Error(result.error || 'Failed to update workflow mode');
+      }
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [activeWorkflowScope]: updatedWorkflow,
+      }));
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to update workflow mode',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [activeWorkflow, task.id, activeVariant, activeWorkflowScope, toast]);
 
   // Build initial issue context (feature parity with single-agent ChatInterface)
   const initialInjection: string | null = useMemo(() => {
@@ -199,7 +565,7 @@ const MultiAgentTask: React.FC<Props> = ({
     return null;
   }, [task.metadata]);
 
-  const injectPrompt = async (ptyId: string, agent: Agent, text: string) => {
+  async function injectPrompt(ptyId: string, agent: Agent, text: string) {
     const trimmed = (text || '').trim();
     if (!trimmed) return;
     let sent = false;
@@ -256,17 +622,15 @@ const MultiAgentTask: React.FC<Props> = ({
       offData?.();
       offStarted?.();
     }, 6000);
-  };
+  }
 
-  const handleRunAll = async () => {
+  const handleSendPrompt = async () => {
     const msg = prompt.trim();
     if (!msg) return;
-    // Send concurrently via PTY injection for all agents (Codex/Claude included)
-    const tasks: Promise<any>[] = [];
-    variants.forEach((v) => {
-      const termId = `${v.worktreeId}-main`;
-      tasks.push(injectPrompt(termId, v.agent, msg));
-    });
+    const targets = promptTarget === 'active' && activeVariant ? [activeVariant] : variants;
+    const tasks: Promise<unknown>[] = targets.map((variant) =>
+      injectPrompt(getVariantTerminalId(variant), variant.agent, msg)
+    );
     await Promise.all(tasks);
     setPrompt('');
   };
@@ -345,8 +709,8 @@ const MultiAgentTask: React.FC<Props> = ({
 
     variants.forEach((variant) => {
       const variantId = variant.worktreeId;
-      const ptyId = `${variant.worktreeId}-main`;
-      busyState.set(variantId, variantBusy[variantId] ?? false);
+      const ptyId = getVariantTerminalId(variant);
+      busyState.set(variantId, false);
 
       const offData = (window as any).electronAPI?.onPtyData?.(ptyId, (chunk: string) => {
         try {
@@ -377,8 +741,7 @@ const MultiAgentTask: React.FC<Props> = ({
       busySince.clear();
       busyState.clear();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [variants]);
+  }, [variants, getVariantTerminalId]);
 
   // Prefill the top input with the prepared issue context once
   const prefillOnceRef = useRef(false);
@@ -473,6 +836,31 @@ const MultiAgentTask: React.FC<Props> = ({
       {variants.map((v, idx) => {
         const isDark = effectiveTheme === 'dark' || effectiveTheme === 'dark-black';
         const isActive = idx === activeTabIndex;
+        const variantScopeKey = getVariantWorkflowScope(v);
+        const hasVariantWorkflowSnapshot = Object.prototype.hasOwnProperty.call(
+          workflowByScope,
+          variantScopeKey
+        );
+        const workflowForVariant =
+          isActive && hasVariantWorkflowSnapshot ? workflowByScope[variantScopeKey] : null;
+        const variantWorkflowLoading = isActive
+          ? Boolean(workflowLoadingByScope[variantScopeKey])
+          : false;
+        const showWorkflowLoadingPlaceholder =
+          isActive && variantWorkflowLoading && !hasVariantWorkflowSnapshot;
+        const selectedSessionConversationId = variantSessionConversationIds[v.worktreeId] || null;
+        const stepSessionOptions =
+          isActive && workflowForVariant
+            ? workflowForVariant.steps
+                .filter((step) => Boolean(step.conversationId))
+                .sort((a, b) => a.number - b.number)
+                .map((step) => ({
+                  stepId: step.id,
+                  number: step.number,
+                  title: step.title,
+                  conversationId: step.conversationId as string,
+                }))
+            : [];
         return (
           <div
             key={v.worktreeId}
@@ -486,6 +874,226 @@ const MultiAgentTask: React.FC<Props> = ({
                   sshConnectionId={projectRemoteConnectionId}
                   isActive={isActive}
                 />
+              </div>
+              <div className="px-6 pt-2">
+                <div className="mx-auto min-h-[132px] max-w-4xl rounded-md border border-border/70 bg-muted/30 p-2">
+                  {showWorkflowLoadingPlaceholder ? (
+                    <div className="flex min-h-[116px] items-center justify-center gap-2 text-xs text-muted-foreground">
+                      <Spinner size="sm" />
+                      Loading workflow...
+                    </div>
+                  ) : isActive && workflowForVariant ? (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-medium text-foreground">Workflow:</span>
+                        <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
+                        <Badge variant="outline">
+                          {workflowTemplateLabel(workflowForVariant.type)}
+                        </Badge>
+                        <Badge variant="secondary">
+                          {workflowForVariant.status.replace('_', ' ')}
+                        </Badge>
+                        <Badge variant="outline">{workflowForVariant.steps.length} steps</Badge>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleToggleWorkflowAuto()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          {workflowForVariant.autoMode === 'auto' ? (
+                            <>
+                              <Pause className="mr-1.5 h-3.5 w-3.5" />
+                              Auto: On
+                            </>
+                          ) : (
+                            <>
+                              <Play className="mr-1.5 h-3.5 w-3.5" />
+                              Auto: Off
+                            </>
+                          )}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleNextWorkflowStep()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          Next Step
+                        </Button>
+                        <Select
+                          value={workflowTemplate}
+                          onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                        >
+                          <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent side="top" className="z-[120]">
+                            <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                            <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                            <SelectItem value="full-sdd">Full SDD</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleInitWorkflowForActive()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          Re-init Active
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={workflowBusy}
+                          onClick={() => void handleInitWorkflowForAll()}
+                          className="h-7 px-2.5 text-xs"
+                        >
+                          Init All Agents
+                        </Button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                        <span className="text-muted-foreground">Sessions:</span>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={selectedSessionConversationId ? 'outline' : 'secondary'}
+                          disabled={workflowBusy}
+                          onClick={() =>
+                            setVariantSessionConversationIds((prev) => ({
+                              ...prev,
+                              [v.worktreeId]: null,
+                            }))
+                          }
+                          className="h-6 px-2 text-xs"
+                        >
+                          Main
+                        </Button>
+                        {stepSessionOptions.map((session) => (
+                          <Button
+                            key={session.stepId}
+                            type="button"
+                            size="sm"
+                            variant={
+                              selectedSessionConversationId === session.conversationId
+                                ? 'secondary'
+                                : 'outline'
+                            }
+                            disabled={workflowBusy}
+                            onClick={() =>
+                              setVariantSessionConversationIds((prev) => ({
+                                ...prev,
+                                [v.worktreeId]: session.conversationId,
+                              }))
+                            }
+                            className="h-6 px-2 text-xs"
+                            title={`Step ${session.number}: ${session.title}`}
+                          >
+                            Step {session.number}
+                          </Button>
+                        ))}
+                      </div>
+                      <div className="space-y-1">
+                        {workflowForVariant.steps
+                          .slice()
+                          .sort((a, b) => a.number - b.number)
+                          .map((step) => {
+                            const isCurrent = workflowForVariant.currentStepId === step.id;
+                            return (
+                              <div
+                                key={step.id}
+                                className={`flex flex-wrap items-center gap-2 rounded border border-border/60 bg-background px-2 py-1 text-xs ${
+                                  isCurrent ? 'border-foreground/30' : ''
+                                }`}
+                              >
+                                <span
+                                  className={`h-2 w-2 rounded-full ${workflowStatusDotClass(step.status)}`}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => void handleStartWorkflowStep(step.id)}
+                                  disabled={workflowBusy}
+                                  className="font-medium text-foreground hover:underline disabled:no-underline disabled:opacity-70"
+                                >
+                                  Step {step.number}: {step.title}
+                                </button>
+                                {step.pausePoint ? (
+                                  <span className="text-muted-foreground">(pause)</span>
+                                ) : null}
+                                <span className="text-muted-foreground">
+                                  chat:{' '}
+                                  {step.conversationId ? (
+                                    <code>{step.conversationId}</code>
+                                  ) : (
+                                    <code>none</code>
+                                  )}
+                                </span>
+                                {step.status !== 'completed' ? (
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => void handleCompleteWorkflowStep(step)}
+                                    disabled={workflowBusy || step.status === 'pending'}
+                                    className="ml-auto h-6 px-2 text-xs"
+                                  >
+                                    <Check className="mr-1 h-3 w-3" />
+                                    Complete
+                                  </Button>
+                                ) : (
+                                  <span className="ml-auto text-green-600">done</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-medium text-foreground">Workflow:</span>
+                      <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
+                      <Select
+                        value={workflowTemplate}
+                        onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                      >
+                        <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent side="top" className="z-[120]">
+                          <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                          <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                          <SelectItem value="full-sdd">Full SDD</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={workflowBusy || !isActive}
+                        onClick={() => void handleInitWorkflowForActive()}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Init Active
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={workflowBusy}
+                        onClick={() => void handleInitWorkflowForAll()}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Init All Agents
+                      </Button>
+                    </div>
+                  )}
+                </div>
               </div>
               <div className="mt-2 flex items-center justify-center px-4 py-2">
                 <TooltipProvider delayDuration={250}>
@@ -549,7 +1157,7 @@ const MultiAgentTask: React.FC<Props> = ({
                 >
                   <TerminalPane
                     ref={isActive ? activeTerminalRef : undefined}
-                    id={`${v.worktreeId}-main`}
+                    id={getVariantTerminalId(v)}
                     cwd={v.path}
                     remote={
                       projectRemoteConnectionId
@@ -601,7 +1209,7 @@ const MultiAgentTask: React.FC<Props> = ({
                         (agentMeta[v.agent]?.initialPromptFlag === undefined ||
                           agentMeta[v.agent]?.useKeystrokeInjection)
                       ) {
-                        void injectPrompt(`${v.worktreeId}-main`, v.agent, initialInjection);
+                        void injectPrompt(getVariantTerminalId(v), v.agent, initialInjection);
                       }
                       // Mark initial injection as sent so it won't re-run on restart
                       if (initialInjection && !task.metadata?.initialInjectionSent) {
@@ -624,35 +1232,32 @@ const MultiAgentTask: React.FC<Props> = ({
 
       <div className="px-6 pb-6 pt-4">
         <div className="mx-auto max-w-4xl">
-          <div className="relative rounded-md border border-border bg-white shadow-lg dark:border-border dark:bg-card">
-            <div className="flex items-center gap-2 rounded-md px-4 py-3">
-              <Input
-                className="h-9 flex-1 border-border bg-muted dark:border-border dark:bg-muted"
-                placeholder="Tell the agents what to do..."
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    if (prompt.trim()) {
-                      void handleRunAll();
-                    }
-                  }
-                }}
-              />
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-9 border border-border bg-muted px-3 text-xs font-medium hover:bg-muted dark:border-border dark:bg-muted dark:hover:bg-muted"
-                onClick={handleRunAll}
-                disabled={!prompt.trim()}
-                title="Run in all panes (Enter)"
-                aria-label="Run in all panes"
-              >
-                <CornerDownLeft className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
+          <TaskMessageComposer
+            value={prompt}
+            onValueChange={setPrompt}
+            onSubmit={() => void handleSendPrompt()}
+            placeholder={
+              promptTarget === 'active'
+                ? 'Send a message to the active agent...'
+                : 'Send a message to all agents...'
+            }
+            submitTitle={
+              promptTarget === 'active'
+                ? 'Send to active agent (Enter)'
+                : 'Send to all agents (Enter)'
+            }
+            submitAriaLabel={
+              promptTarget === 'active' ? 'Send to active agent' : 'Send to all agents'
+            }
+            mode={{
+              value: promptTarget,
+              onChange: (value) => setPromptTarget(value as 'active' | 'all'),
+              options: [
+                { value: 'all', label: 'All Agents' },
+                { value: 'active', label: 'Active Agent' },
+              ],
+            }}
+          />
         </div>
       </div>
     </div>

@@ -13,14 +13,15 @@ export function useInitialPromptInjection(opts: {
   providerId: string; // codex | claude | ... used for PTY id prefix
   prompt?: string | null;
   enabled?: boolean;
+  scopeId?: string;
 }) {
-  const { taskId, providerId, prompt, enabled = true } = opts;
+  const { taskId, providerId, prompt, enabled = true, scopeId } = opts;
 
   useEffect(() => {
     if (!enabled) return;
     const trimmed = (prompt || '').trim();
     if (!trimmed) return;
-    const sentKey = initialPromptSentKey(taskId, providerId);
+    const sentKey = initialPromptSentKey(taskId, providerId, scopeId);
     if (localStorage.getItem(sentKey) === '1') return;
 
     const ptyId = makePtyId(providerId as ProviderId, 'main', taskId);
@@ -73,5 +74,5 @@ export function useInitialPromptInjection(opts: {
       offStarted?.();
       offData?.();
     };
-  }, [enabled, taskId, providerId, prompt]);
+  }, [enabled, taskId, providerId, prompt, scopeId]);
 }

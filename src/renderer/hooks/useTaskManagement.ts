@@ -303,12 +303,12 @@ export function useTaskManagement(options: UseTaskManagementOptions) {
         } catch {}
         // Kill main agent terminals
         // Single-agent: makePtyId(provider, 'main', task.id)
-        // Multi-agent: ${variant.worktreeId}-main (different format, not provider-prefixed)
+        // Multi-agent: makePtyId(variant.agent, 'main', variant.worktreeId)
         const variants = task.metadata?.multiAgent?.variants || [];
         const mainSessionIds: string[] = [];
         if (variants.length > 0) {
           for (const v of variants) {
-            const id = `${v.worktreeId}-main`;
+            const id = makePtyId(v.agent as ProviderId, 'main', v.worktreeId);
             mainSessionIds.push(id);
             try {
               window.electronAPI.ptyKill?.(id);
@@ -609,7 +609,7 @@ export function useTaskManagement(options: UseTaskManagementOptions) {
           const mainSessionIds: string[] = [];
           if (variants.length > 0) {
             for (const v of variants) {
-              const id = `${v.worktreeId}-main`;
+              const id = makePtyId(v.agent as ProviderId, 'main', v.worktreeId);
               mainSessionIds.push(id);
               try {
                 window.electronAPI.ptyKill?.(id);
