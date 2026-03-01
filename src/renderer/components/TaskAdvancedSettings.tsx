@@ -6,6 +6,7 @@ import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import { Spinner } from './ui/spinner';
 import { Textarea } from './ui/textarea';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from './ui/accordion';
 import { LinearIssueSelector } from './LinearIssueSelector';
 import { GitHubIssueSelector } from './GitHubIssueSelector';
@@ -16,6 +17,7 @@ import { type LinearIssueSummary } from '../types/linear';
 import { type GitHubIssueSummary } from '../types/github';
 import { type GitHubIssueLink } from '../types/chat';
 import { type JiraIssueSummary } from '../types/jira';
+import type { WorkflowTemplate } from '@shared/workflow/types';
 
 interface TaskAdvancedSettingsProps {
   isOpen: boolean;
@@ -33,6 +35,8 @@ interface TaskAdvancedSettingsProps {
   // Initial prompt
   initialPrompt: string;
   onInitialPromptChange: (value: string) => void;
+  initialPromptWorkflow: WorkflowTemplate | null;
+  onInitialPromptWorkflowChange: (value: WorkflowTemplate | null) => void;
   hasInitialPromptSupport: boolean;
 
   // Linear
@@ -67,6 +71,8 @@ export const TaskAdvancedSettings: React.FC<TaskAdvancedSettingsProps> = ({
   hasAutoApproveSupport,
   initialPrompt,
   onInitialPromptChange,
+  initialPromptWorkflow,
+  onInitialPromptWorkflowChange,
   hasInitialPromptSupport,
   selectedLinearIssue,
   onLinearIssueChange,
@@ -409,6 +415,31 @@ export const TaskAdvancedSettings: React.FC<TaskAdvancedSettingsProps> = ({
                   className="resize-none"
                   rows={3}
                 />
+              </div>
+            </div>
+
+            <div className="flex items-start gap-4 p-2">
+              <Label className="w-32 shrink-0 pt-2">Prompt workflow</Label>
+              <div className="min-w-0 flex-1">
+                <Select
+                  value={initialPromptWorkflow ?? undefined}
+                  onValueChange={(value) =>
+                    onInitialPromptWorkflowChange((value || null) as WorkflowTemplate | null)
+                  }
+                  disabled={!hasInitialPromptSupport}
+                >
+                  <SelectTrigger className="h-9 w-full">
+                    <SelectValue placeholder="Select workflow (required if prompt is set)" />
+                  </SelectTrigger>
+                  <SelectContent side="top" className="z-[120]">
+                    <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                    <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                    <SelectItem value="full-sdd">Full SDD</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Required when an initial prompt is provided.
+                </p>
               </div>
             </div>
           </AccordionContent>
