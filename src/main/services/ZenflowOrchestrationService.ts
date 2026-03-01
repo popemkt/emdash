@@ -59,21 +59,18 @@ class ZenflowOrchestrationService extends EventEmitter {
     const artifactsDir = path.join(args.worktreePath, '.zenflow');
     fs.mkdirSync(artifactsDir, { recursive: true });
 
-    // Create a conversation for each step (reuses emdash multi-chat system)
-    const conversationIds: string[] = [];
-    for (let i = 0; i < template.steps.length; i++) {
-      const stepTemplate = template.steps[i];
-      const stepNumber = i + 1;
-      const conversation = await databaseService.createConversation(
-        args.taskId,
-        `Step ${stepNumber}: ${stepTemplate.name}`,
-        'claude', // default provider; user can change per step
-        stepNumber === 1 // first step is the "main" conversation
-      );
-      conversationIds.push(conversation.id);
-    }
+    // Only create a conversation for step 1 (starts immediately).
+    // Other steps get conversations when they start, avoiding the
+    // "lands on step 2" bug and enabling placeholder UX for unstarted steps.
+    const firstStepTemplate = template.steps[0];
+    const firstConversation = await databaseService.createConversation(
+      args.taskId,
+      `Step 1: ${firstStepTemplate.name}`,
+      'claude', // default provider; user can change per step
+      true // first step is the "main" conversation
+    );
 
-    // Create step records from template with conversation links
+    // Create step records from template — only step 1 gets a conversationId
     const steps: WorkflowStepInsert[] = template.steps.map((stepTemplate, index) => {
       const stepNumber = index + 1;
       const prompt = this.resolvePromptTemplate(stepTemplate.promptTemplate, {
@@ -85,7 +82,7 @@ class ZenflowOrchestrationService extends EventEmitter {
       return {
         id: `step-${args.taskId}-${stepNumber}`,
         taskId: args.taskId,
-        conversationId: conversationIds[index],
+        conversationId: stepNumber === 1 ? firstConversation.id : null,
         stepNumber,
         name: stepTemplate.name,
         type: stepTemplate.type,
@@ -285,20 +282,39 @@ class ZenflowOrchestrationService extends EventEmitter {
 
   /**
    * Start a specific step — mark it running, update plan.md, and emit event.
+   * Creates a conversation for the step if it doesn't have one yet.
    * The renderer switches to the step's conversation tab and spawns the PTY.
    */
   async startStep(taskId: string, stepId: string): Promise<void> {
+    // Create conversation if this step doesn't have one yet (deferred creation)
+    let step = await databaseService.getWorkflowStep(stepId);
+    if (!step) return;
+
+    if (!step.conversationId) {
+      const conversation = await databaseService.createConversation(
+        taskId,
+        `Step ${step.stepNumber}: ${step.name}`,
+        'claude',
+        false
+      );
+      await databaseService.updateWorkflowStepStatus(stepId, step.status as any, {
+        conversationId: conversation.id,
+      });
+      // Re-read to get the updated conversationId
+      step = (await databaseService.getWorkflowStep(stepId))!;
+    }
+
     await databaseService.updateWorkflowStepStatus(stepId, 'running', {
       startedAt: new Date().toISOString(),
     });
 
-    const step = await databaseService.getWorkflowStep(stepId);
-    if (!step) return;
-
-    // Update plan.md and snapshot the new statuses
+    // Update plan.md (status + conversationId if newly created) and snapshot
     const worktreePath = await this.getWorktreePath(taskId);
-    if (step.conversationId && worktreePath) {
-      await zenflowPlanService.updateStepStatus(worktreePath, step.conversationId, 'running');
+    if (worktreePath) {
+      await zenflowPlanService.updateStepByNumber(worktreePath, step.stepNumber, {
+        status: 'running',
+        conversationId: step.conversationId,
+      });
       // Re-snapshot so watcher knows this step is now "running"
       const plan = await zenflowPlanService.readPlan(worktreePath);
       if (plan) {
@@ -383,7 +399,7 @@ class ZenflowOrchestrationService extends EventEmitter {
 
   /**
    * Dynamically expand the workflow with new implementation steps.
-   * Creates new conversations and step records, updates plan.md.
+   * Conversations are created lazily when each step starts (deferred creation).
    */
   async expandSteps(
     taskId: string,
@@ -392,25 +408,13 @@ class ZenflowOrchestrationService extends EventEmitter {
     const existingSteps = await databaseService.getWorkflowSteps(taskId);
     const maxStepNumber = Math.max(...existingSteps.map((s) => s.stepNumber), 0);
 
-    // Create conversations for each new step
-    const conversationIds: string[] = [];
-    for (let i = 0; i < newSteps.length; i++) {
-      const stepNumber = maxStepNumber + 1 + i;
-      const conversation = await databaseService.createConversation(
-        taskId,
-        `Step ${stepNumber}: ${newSteps[i].name}`,
-        'claude',
-        false
-      );
-      conversationIds.push(conversation.id);
-    }
-
+    // No conversations created here — deferred to startStep
     const stepRecords: WorkflowStepInsert[] = newSteps.map((s, i) => {
       const stepNumber = maxStepNumber + 1 + i;
       return {
         id: `step-${taskId}-${stepNumber}`,
         taskId,
-        conversationId: conversationIds[i],
+        conversationId: null,
         stepNumber,
         name: s.name,
         type: 'implementation',
@@ -437,7 +441,7 @@ class ZenflowOrchestrationService extends EventEmitter {
         name: newSteps[i].name,
         type: 'implementation',
         status: 'pending',
-        conversationId: conversationIds[i],
+        conversationId: null,
         pauseAfter: false,
       }));
       await zenflowPlanService.appendSteps(worktreePath, newPlanSteps);

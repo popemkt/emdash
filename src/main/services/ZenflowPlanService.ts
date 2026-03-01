@@ -1,7 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { BrowserWindow } from 'electron';
-import { parsePlanMd, writePlanMd, updateStepInPlan, addStepsToPlan } from '@shared/zenflow/planMd';
+import {
+  parsePlanMd,
+  writePlanMd,
+  updateStepInPlan,
+  updateStepByNumber as updateStepByNumberMd,
+  addStepsToPlan,
+} from '@shared/zenflow/planMd';
 import type { PlanDocument, PlanStepData, WorkflowStepStatus } from '@shared/zenflow/types';
 import { log } from '../lib/logger';
 
@@ -120,6 +126,22 @@ export class ZenflowPlanService {
       await fs.promises.writeFile(planPath, updated, 'utf-8');
     } catch (err) {
       log.error('[zenflow-plan] Failed to update step status in plan.md', err);
+    }
+  }
+
+  /** Update a step in plan.md by step number (supports updating conversationId + status). */
+  async updateStepByNumber(
+    worktreePath: string,
+    stepNumber: number,
+    updates: Partial<PlanStepData>
+  ): Promise<void> {
+    const planPath = this.getPlanPath(worktreePath);
+    try {
+      const content = await fs.promises.readFile(planPath, 'utf-8');
+      const updated = updateStepByNumberMd(content, stepNumber, updates);
+      await fs.promises.writeFile(planPath, updated, 'utf-8');
+    } catch (err) {
+      log.error('[zenflow-plan] Failed to update step by number in plan.md', err);
     }
   }
 

@@ -31,6 +31,7 @@ vi.mock('../../main/services/ZenflowPlanService', () => ({
     readPlan: vi.fn().mockResolvedValue(null),
     writePlan: vi.fn().mockResolvedValue(undefined),
     updateStepStatus: vi.fn().mockResolvedValue(undefined),
+    updateStepByNumber: vi.fn().mockResolvedValue(undefined),
     appendSteps: vi.fn().mockResolvedValue(undefined),
     startWatching: vi.fn(),
     stopWatching: vi.fn(),
@@ -122,9 +123,12 @@ describe('ZenflowOrchestrationService', () => {
       expect(steps[0].type).toBe('spec');
       expect(steps[0].stepNumber).toBe(1);
       expect(steps[0].pauseAfter).toBe(1);
+      // Only step 1 gets a conversationId; step 2 is deferred
+      expect(steps[0].conversationId).toBeTruthy();
       expect(steps[1].name).toBe('Implementation');
       expect(steps[1].type).toBe('implementation');
       expect(steps[1].stepNumber).toBe(2);
+      expect(steps[1].conversationId).toBeNull();
     });
 
     it('creates steps from full-sdd template', async () => {
@@ -280,8 +284,11 @@ describe('ZenflowOrchestrationService', () => {
       expect(allSteps.length).toBe(3);
       expect(allSteps[1].name).toBe('Build API');
       expect(allSteps[1].stepNumber).toBe(2);
+      // Conversations are deferred — not created during expand
+      expect(allSteps[1].conversationId).toBeNull();
       expect(allSteps[2].name).toBe('Build UI');
       expect(allSteps[2].stepNumber).toBe(3);
+      expect(allSteps[2].conversationId).toBeNull();
     });
   });
 

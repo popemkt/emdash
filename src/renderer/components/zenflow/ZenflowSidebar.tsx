@@ -16,6 +16,7 @@ interface ZenflowSidebarProps {
   onStartStep: (stepId: string) => void;
   onRetryStep: (stepId: string) => void;
   onStepClick: (conversationId: string) => void;
+  onPendingStepClick?: (step: PlanStepData) => void;
   taskId: string;
   taskPath?: string;
 }
@@ -30,6 +31,7 @@ const ZenflowSidebar: React.FC<ZenflowSidebarProps> = ({
   onStartStep,
   onRetryStep,
   onStepClick,
+  onPendingStepClick,
   taskId,
   taskPath,
 }) => {
@@ -169,7 +171,11 @@ const ZenflowSidebar: React.FC<ZenflowSidebarProps> = ({
             isActive={step.conversationId === activeConversationId}
             isNextPending={step === nextPendingStep}
             onClick={() => {
-              if (step.conversationId) onStepClick(step.conversationId);
+              if (step.conversationId) {
+                onStepClick(step.conversationId);
+              } else if (onPendingStepClick) {
+                onPendingStepClick(step);
+              }
             }}
             onStart={() => onStartStep(`step-${taskId}-${step.stepNumber}`)}
             onRetry={() => onRetryStep(`step-${taskId}-${step.stepNumber}`)}
