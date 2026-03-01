@@ -1,22 +1,26 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { type Task } from '../types/chat';
 import { type Agent } from '../types';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
+import { Badge } from './ui/badge';
 import OpenInMenu from './titlebar/OpenInMenu';
 import { TerminalPane } from './TerminalPane';
 import { agentMeta } from '@/providers/meta';
 import { agentAssets } from '@/providers/assets';
 import AgentLogo from './AgentLogo';
 import { useTheme } from '@/hooks/useTheme';
+import { useToast } from '@/hooks/use-toast';
 import { classifyActivity } from '@/lib/activityClassifier';
 import { activityStore } from '@/lib/activityStore';
 import { Spinner } from './ui/spinner';
 import { BUSY_HOLD_MS, CLEAR_BUSY_MS, INJECT_ENTER_DELAY_MS } from '@/lib/activityConstants';
 import { CornerDownLeft } from 'lucide-react';
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { getTaskEnvVars } from '@shared/task/envVars';
+import type { WorkflowState, WorkflowTemplate } from '@shared/workflow/types';
 
 interface Props {
   task: Task;
@@ -38,6 +42,23 @@ type Variant = {
   worktreeId: string;
 };
 
+function normalizeWorkflowScopeKey(raw: string | null | undefined): string {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!value) return 'default';
+  const normalized = value.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized || 'default';
+}
+
+function getVariantWorkflowScope(variant: Variant): string {
+  return normalizeWorkflowScopeKey(variant.worktreeId || variant.id || variant.agent);
+}
+
+function workflowTemplateLabel(template: WorkflowTemplate): string {
+  if (template === 'full-sdd') return 'Full SDD';
+  if (template === 'spec-and-build') return 'Spec & Build';
+  return 'Simple Prompt';
+}
+
 const MultiAgentTask: React.FC<Props> = ({
   task,
   projectPath,
@@ -47,11 +68,17 @@ const MultiAgentTask: React.FC<Props> = ({
   onTaskInterfaceReady,
 }) => {
   const { effectiveTheme } = useTheme();
+  const { toast } = useToast();
   const [prompt, setPrompt] = useState('');
   const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [variantBusy, setVariantBusy] = useState<Record<string, boolean>>({});
+  const [activeWorkflow, setActiveWorkflow] = useState<WorkflowState | null>(null);
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowTemplate, setWorkflowTemplate] = useState<WorkflowTemplate>('simple-prompt');
   const multi = task.metadata?.multiAgent;
   const variants = (multi?.variants || []) as Variant[];
+  const activeVariant = variants[activeTabIndex] || null;
+  const activeWorkflowScope = activeVariant ? getVariantWorkflowScope(activeVariant) : null;
 
   const variantEnvs = useMemo(() => {
     if (!projectPath) return new Map<string, Record<string, string>>();
@@ -105,6 +132,95 @@ const MultiAgentTask: React.FC<Props> = ({
 
     return `${baseName} #${instanceNum}`;
   };
+
+  const loadActiveWorkflow = useCallback(async () => {
+    if (!activeVariant || !activeWorkflowScope) {
+      setActiveWorkflow(null);
+      return;
+    }
+
+    try {
+      const result = await window.electronAPI.workflowGet({
+        taskId: task.id,
+        scopeKey: activeWorkflowScope,
+        taskPathOverride: activeVariant.path,
+      });
+      if (!result.success) {
+        setActiveWorkflow(null);
+        return;
+      }
+      setActiveWorkflow((result.workflow as WorkflowState | null | undefined) || null);
+    } catch {
+      setActiveWorkflow(null);
+    }
+  }, [task.id, activeVariant, activeWorkflowScope]);
+
+  useEffect(() => {
+    void loadActiveWorkflow();
+  }, [loadActiveWorkflow]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadActiveWorkflow();
+    }, 2500);
+    return () => window.clearInterval(intervalId);
+  }, [loadActiveWorkflow]);
+
+  const initializeWorkflowForVariant = useCallback(
+    async (variant: Variant, template: WorkflowTemplate) => {
+      const scopeKey = getVariantWorkflowScope(variant);
+      const result = await window.electronAPI.workflowCreate({
+        taskId: task.id,
+        template,
+        featureDescription:
+          (task.metadata?.initialPrompt as string | undefined)?.trim() || task.name,
+        scopeKey,
+        taskPathOverride: variant.path,
+      });
+      if (!result.success || !result.workflow) {
+        throw new Error(result.error || 'Failed to initialize workflow');
+      }
+      if (variant.worktreeId === activeVariant?.worktreeId) {
+        setActiveWorkflow(result.workflow);
+      }
+    },
+    [task.id, task.name, task.metadata?.initialPrompt, activeVariant?.worktreeId]
+  );
+
+  const handleInitWorkflowForActive = useCallback(async () => {
+    if (!activeVariant) return;
+    setWorkflowBusy(true);
+    try {
+      await initializeWorkflowForVariant(activeVariant, workflowTemplate);
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to initialize workflow',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [activeVariant, initializeWorkflowForVariant, workflowTemplate, toast]);
+
+  const handleInitWorkflowForAll = useCallback(async () => {
+    if (variants.length === 0) return;
+    setWorkflowBusy(true);
+    try {
+      await Promise.all(
+        variants.map((variant) => initializeWorkflowForVariant(variant, workflowTemplate))
+      );
+      await loadActiveWorkflow();
+    } catch (error) {
+      toast({
+        title: 'Workflow Error',
+        description: error instanceof Error ? error.message : 'Failed to initialize workflows',
+        variant: 'destructive',
+      });
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [variants, initializeWorkflowForVariant, workflowTemplate, loadActiveWorkflow, toast]);
 
   // Build initial issue context (feature parity with single-agent ChatInterface)
   const initialInjection: string | null = useMemo(() => {
@@ -486,6 +602,56 @@ const MultiAgentTask: React.FC<Props> = ({
                   sshConnectionId={projectRemoteConnectionId}
                   isActive={isActive}
                 />
+              </div>
+              <div className="px-6 pt-2">
+                <div className="mx-auto max-w-4xl rounded-md border border-border/70 bg-muted/30 p-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-medium text-foreground">Workflow:</span>
+                    <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
+                    {isActive && activeWorkflow ? (
+                      <>
+                        <Badge variant="outline">
+                          {workflowTemplateLabel(activeWorkflow.type)}
+                        </Badge>
+                        <Badge variant="secondary">{activeWorkflow.status.replace('_', ' ')}</Badge>
+                        <Badge variant="outline">{activeWorkflow.steps.length} steps</Badge>
+                      </>
+                    ) : null}
+                    <Select
+                      value={workflowTemplate}
+                      onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                    >
+                      <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent side="top" className="z-[120]">
+                        <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                        <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                        <SelectItem value="full-sdd">Full SDD</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={workflowBusy || !isActive}
+                      onClick={() => void handleInitWorkflowForActive()}
+                      className="h-7 px-2.5 text-xs"
+                    >
+                      Init Active
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={workflowBusy}
+                      onClick={() => void handleInitWorkflowForAll()}
+                      className="h-7 px-2.5 text-xs"
+                    >
+                      Init All Agents
+                    </Button>
+                  </div>
+                </div>
               </div>
               <div className="mt-2 flex items-center justify-center px-4 py-2">
                 <TooltipProvider delayDuration={250}>

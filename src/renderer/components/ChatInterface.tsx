@@ -63,6 +63,12 @@ function normalizeWorkflowScopeKey(raw: string | null | undefined): string {
   return normalized || 'default';
 }
 
+function workflowTemplateLabel(template: WorkflowTemplate): string {
+  if (template === 'full-sdd') return 'Full SDD';
+  if (template === 'spec-and-build') return 'Spec & Build';
+  return 'Simple Prompt';
+}
+
 const ChatInterface: React.FC<Props> = ({
   task,
   projectName: _projectName,
@@ -811,28 +817,6 @@ const ChatInterface: React.FC<Props> = ({
     }
   }, [workflow, task.id, workflowScopeKey, toast]);
 
-  const handleReparseWorkflowPlan = useCallback(async () => {
-    setWorkflowBusy(true);
-    try {
-      const result = await window.electronAPI.workflowReparsePlan({
-        taskId: task.id,
-        scopeKey: workflowScopeKey,
-      });
-      if (!result.success || !result.workflow) {
-        throw new Error(result.error || 'Failed to reparse workflow plan');
-      }
-      setWorkflow(result.workflow);
-    } catch (error) {
-      toast({
-        title: 'Workflow Error',
-        description: error instanceof Error ? error.message : 'Failed to reparse plan',
-        variant: 'destructive',
-      });
-    } finally {
-      setWorkflowBusy(false);
-    }
-  }, [task.id, workflowScopeKey, toast]);
-
   // Persist last-selected agent per task (including Droid)
   useEffect(() => {
     try {
@@ -1163,6 +1147,13 @@ const ChatInterface: React.FC<Props> = ({
                     <span className="font-medium text-foreground">Workflow:</span>
                     <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
                     <button
+                      onClick={() => void handleInitializeWorkflow('simple-prompt')}
+                      disabled={workflowBusy}
+                      className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Initialize Simple Prompt
+                    </button>
+                    <button
                       onClick={() => void handleInitializeWorkflow('full-sdd')}
                       disabled={workflowBusy}
                       className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
@@ -1181,9 +1172,7 @@ const ChatInterface: React.FC<Props> = ({
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2 text-xs">
                       <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
-                      <Badge variant="outline">
-                        {workflow.type === 'full-sdd' ? 'Full SDD' : 'Spec & Build'}
-                      </Badge>
+                      <Badge variant="outline">{workflowTemplateLabel(workflow.type)}</Badge>
                       <Badge variant="secondary">{workflow.status.replace('_', ' ')}</Badge>
                       <button
                         onClick={() => void handleToggleWorkflowAuto()}
@@ -1208,13 +1197,6 @@ const ChatInterface: React.FC<Props> = ({
                         className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         Next Step
-                      </button>
-                      <button
-                        onClick={() => void handleReparseWorkflowPlan()}
-                        disabled={workflowBusy}
-                        className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        Reparse Plan
                       </button>
                     </div>
                     <div className="space-y-1">
