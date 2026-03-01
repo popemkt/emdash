@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
-import { Check, CornerDownLeft, Pause, Play, Plus, X } from 'lucide-react';
+import { Check, Pause, Play, Plus, X } from 'lucide-react';
 import { useToast } from '../hooks/use-toast';
 import { useTheme } from '../hooks/useTheme';
 import { TerminalPane } from './TerminalPane';
@@ -26,9 +26,11 @@ import { type Conversation } from '../../main/services/DatabaseService';
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { makePtyId } from '@shared/ptyId';
-import { Input } from './ui/input';
 import { Button } from './ui/button';
 import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import TaskMessageComposer from './TaskMessageComposer';
+import { workflowStatusDotClass, workflowTemplateLabel } from '@/lib/workflowUi';
 
 declare const window: Window & {
   electronAPI: {
@@ -65,12 +67,6 @@ function normalizeWorkflowScopeKey(raw: string | null | undefined): string {
   return normalized || 'default';
 }
 
-function workflowTemplateLabel(template: WorkflowTemplate): string {
-  if (template === 'full-sdd') return 'Full SDD';
-  if (template === 'spec-and-build') return 'Spec & Build';
-  return 'Simple Prompt';
-}
-
 const ChatInterface: React.FC<Props> = ({
   task,
   projectName: _projectName,
@@ -101,8 +97,10 @@ const ChatInterface: React.FC<Props> = ({
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
   const [busyByConversationId, setBusyByConversationId] = useState<Record<string, boolean>>({});
   const [messageBarPrompt, setMessageBarPrompt] = useState('');
-  const [workflow, setWorkflow] = useState<WorkflowState | null>(null);
+  const [workflowByScope, setWorkflowByScope] = useState<Record<string, WorkflowState | null>>({});
+  const [workflowLoadingByScope, setWorkflowLoadingByScope] = useState<Record<string, boolean>>({});
   const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowTemplate, setWorkflowTemplate] = useState<WorkflowTemplate>('simple-prompt');
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
 
@@ -125,6 +123,31 @@ const ChatInterface: React.FC<Props> = ({
   const workflowScopeKey = useMemo(
     () => normalizeWorkflowScopeKey(workflowProvider),
     [workflowProvider]
+  );
+  const hasWorkflowSnapshot = Object.prototype.hasOwnProperty.call(
+    workflowByScope,
+    workflowScopeKey
+  );
+  const workflow = hasWorkflowSnapshot ? (workflowByScope[workflowScopeKey] ?? null) : null;
+  const workflowLoading = Boolean(workflowLoadingByScope[workflowScopeKey]);
+  const showWorkflowLoadingPlaceholder = workflowLoading && !hasWorkflowSnapshot;
+  const selectedSessionConversationId = activeConversation?.isMain
+    ? null
+    : (activeConversationId ?? null);
+  const workflowSessionOptions = useMemo(
+    () =>
+      workflow
+        ? workflow.steps
+            .filter((step) => Boolean(step.conversationId))
+            .sort((a, b) => a.number - b.number)
+            .map((step) => ({
+              stepId: step.id,
+              number: step.number,
+              title: step.title,
+              conversationId: step.conversationId as string,
+            }))
+        : [],
+    [workflow]
   );
   const activeWorkflowStepPrompt = useMemo(() => {
     const metadata = activeConversationMetadata.workflowStep;
@@ -283,18 +306,44 @@ const ChatInterface: React.FC<Props> = ({
   }, [task.id]);
 
   const loadWorkflow = useCallback(async () => {
+    const scopeKey = workflowScopeKey;
+    setWorkflowLoadingByScope((prev) => ({
+      ...prev,
+      [scopeKey]: true,
+    }));
     try {
       const result = await window.electronAPI.workflowGet({
         taskId: task.id,
-        scopeKey: workflowScopeKey,
+        scopeKey,
       });
-      if (result.success) {
-        setWorkflow((result.workflow as WorkflowState | null | undefined) || null);
+      if (!result.success) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [scopeKey]: null,
+        }));
+        return;
       }
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: (result.workflow as WorkflowState | null | undefined) || null,
+      }));
     } catch {
-      setWorkflow(null);
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: null,
+      }));
+    } finally {
+      setWorkflowLoadingByScope((prev) => ({
+        ...prev,
+        [scopeKey]: false,
+      }));
     }
   }, [task.id, workflowScopeKey]);
+
+  useEffect(() => {
+    setWorkflowByScope({});
+    setWorkflowLoadingByScope({});
+  }, [task.id]);
 
   useEffect(() => {
     void loadWorkflow();
@@ -687,7 +736,11 @@ const ChatInterface: React.FC<Props> = ({
         if (!result.success || !result.workflow) {
           throw new Error(result.error || 'Failed to initialize workflow');
         }
-        setWorkflow(result.workflow);
+        const createdWorkflow = result.workflow;
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: createdWorkflow,
+        }));
       } catch (error) {
         toast({
           title: 'Workflow Error',
@@ -714,7 +767,11 @@ const ChatInterface: React.FC<Props> = ({
         if (!result.success || !result.workflow) {
           throw new Error(result.error || 'Failed to start step');
         }
-        setWorkflow(result.workflow);
+        const startedWorkflow = result.workflow;
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: startedWorkflow,
+        }));
         await reloadConversations();
       } catch (error) {
         toast({
@@ -755,7 +812,10 @@ const ChatInterface: React.FC<Props> = ({
           }
         }
 
-        setWorkflow(nextWorkflow);
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: nextWorkflow,
+        }));
       } catch (error) {
         toast({
           title: 'Workflow Error',
@@ -780,8 +840,12 @@ const ChatInterface: React.FC<Props> = ({
       if (!result.success) {
         throw new Error(result.error || 'Failed to start next step');
       }
-      if (result.result) {
-        setWorkflow(result.result.workflow);
+      const nextStepResult = result.result;
+      if (nextStepResult) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [workflowScopeKey]: nextStepResult.workflow,
+        }));
         await reloadConversations();
       }
     } catch (error) {
@@ -808,7 +872,11 @@ const ChatInterface: React.FC<Props> = ({
       if (!result.success || !result.workflow) {
         throw new Error(result.error || 'Failed to update workflow mode');
       }
-      setWorkflow(result.workflow);
+      const updatedWorkflow = result.workflow;
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [workflowScopeKey]: updatedWorkflow,
+      }));
     } catch (error) {
       toast({
         title: 'Workflow Error',
@@ -1158,43 +1226,27 @@ const ChatInterface: React.FC<Props> = ({
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="px-6 pt-4">
             <div className="mx-auto max-w-4xl space-y-2">
-              <div className="rounded-md border border-border/70 bg-muted/30 p-2">
-                {!workflow ? (
-                  <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="font-medium text-foreground">Workflow:</span>
-                    <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
-                    <button
-                      onClick={() => void handleInitializeWorkflow('simple-prompt')}
-                      disabled={workflowBusy}
-                      className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Initialize Simple Prompt
-                    </button>
-                    <button
-                      onClick={() => void handleInitializeWorkflow('full-sdd')}
-                      disabled={workflowBusy}
-                      className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Initialize Full SDD
-                    </button>
-                    <button
-                      onClick={() => void handleInitializeWorkflow('spec-and-build')}
-                      disabled={workflowBusy}
-                      className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Initialize Spec & Build
-                    </button>
+              <div className="min-h-[132px] rounded-md border border-border/70 bg-muted/30 p-2">
+                {showWorkflowLoadingPlaceholder ? (
+                  <div className="flex min-h-[116px] items-center justify-center gap-2 text-xs text-muted-foreground">
+                    <Spinner size="sm" />
+                    Loading workflow...
                   </div>
-                ) : (
+                ) : workflow ? (
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-medium text-foreground">Workflow:</span>
                       <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
                       <Badge variant="outline">{workflowTemplateLabel(workflow.type)}</Badge>
                       <Badge variant="secondary">{workflow.status.replace('_', ' ')}</Badge>
-                      <button
+                      <Badge variant="outline">{workflow.steps.length} steps</Badge>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
                         onClick={() => void handleToggleWorkflowAuto()}
                         disabled={workflowBusy}
-                        className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        className="h-7 px-2.5 text-xs"
                       >
                         {workflow.autoMode === 'auto' ? (
                           <>
@@ -1207,14 +1259,75 @@ const ChatInterface: React.FC<Props> = ({
                             Auto: Off
                           </>
                         )}
-                      </button>
-                      <button
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
                         onClick={() => void handleNextWorkflowStep()}
                         disabled={workflowBusy}
-                        className="inline-flex h-7 items-center rounded-md border border-border bg-background px-2.5 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        className="h-7 px-2.5 text-xs"
                       >
                         Next Step
-                      </button>
+                      </Button>
+                      <Select
+                        value={workflowTemplate}
+                        onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                      >
+                        <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent side="top" className="z-[120]">
+                          <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                          <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                          <SelectItem value="full-sdd">Full SDD</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleInitializeWorkflow(workflowTemplate)}
+                        disabled={workflowBusy}
+                        className="h-7 px-2.5 text-xs"
+                      >
+                        Re-init Active
+                      </Button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                      <span className="text-muted-foreground">Sessions:</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={!selectedSessionConversationId ? 'secondary' : 'outline'}
+                        onClick={() => {
+                          if (mainConversationId) {
+                            void handleSwitchChat(mainConversationId);
+                          }
+                        }}
+                        disabled={workflowBusy || !mainConversationId}
+                        className="h-6 px-2 text-xs"
+                      >
+                        Main
+                      </Button>
+                      {workflowSessionOptions.map((session) => (
+                        <Button
+                          key={session.stepId}
+                          type="button"
+                          size="sm"
+                          variant={
+                            selectedSessionConversationId === session.conversationId
+                              ? 'secondary'
+                              : 'outline'
+                          }
+                          onClick={() => void handleSwitchChat(session.conversationId)}
+                          disabled={workflowBusy}
+                          className="h-6 px-2 text-xs"
+                          title={`Step ${session.number}: ${session.title}`}
+                        >
+                          Step {session.number}
+                        </Button>
+                      ))}
                     </div>
                     <div className="space-y-1">
                       {workflow.steps
@@ -1222,14 +1335,6 @@ const ChatInterface: React.FC<Props> = ({
                         .sort((a, b) => a.number - b.number)
                         .map((step) => {
                           const isCurrent = workflow.currentStepId === step.id;
-                          const statusDot =
-                            step.status === 'completed'
-                              ? 'bg-green-500'
-                              : step.status === 'blocked'
-                                ? 'bg-red-500'
-                                : step.status === 'in_progress'
-                                  ? 'bg-amber-500'
-                                  : 'bg-muted-foreground/50';
                           return (
                             <div
                               key={step.id}
@@ -1238,8 +1343,14 @@ const ChatInterface: React.FC<Props> = ({
                                 isCurrent && 'border-foreground/30'
                               )}
                             >
-                              <span className={cn('h-2 w-2 rounded-full', statusDot)} />
+                              <span
+                                className={cn(
+                                  'h-2 w-2 rounded-full',
+                                  workflowStatusDotClass(step.status)
+                                )}
+                              />
                               <button
+                                type="button"
                                 onClick={() => void handleStartWorkflowStep(step.id)}
                                 disabled={workflowBusy}
                                 className="font-medium text-foreground hover:underline disabled:no-underline disabled:opacity-70"
@@ -1258,14 +1369,17 @@ const ChatInterface: React.FC<Props> = ({
                                 )}
                               </span>
                               {step.status !== 'completed' ? (
-                                <button
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
                                   onClick={() => void handleCompleteWorkflowStep(step)}
                                   disabled={workflowBusy || step.status === 'pending'}
-                                  className="ml-auto inline-flex h-6 items-center rounded-md border border-border px-2 text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  className="ml-auto h-6 px-2 text-xs"
                                 >
                                   <Check className="mr-1 h-3 w-3" />
                                   Complete
-                                </button>
+                                </Button>
                               ) : (
                                 <span className="ml-auto text-green-600">done</span>
                               )}
@@ -1273,6 +1387,34 @@ const ChatInterface: React.FC<Props> = ({
                           );
                         })}
                     </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-medium text-foreground">Workflow:</span>
+                    <Badge variant="outline">Scope: {workflowScopeKey}</Badge>
+                    <Select
+                      value={workflowTemplate}
+                      onValueChange={(value) => setWorkflowTemplate(value as WorkflowTemplate)}
+                    >
+                      <SelectTrigger className="h-7 w-[160px] bg-background text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent side="top" className="z-[120]">
+                        <SelectItem value="simple-prompt">Simple Prompt</SelectItem>
+                        <SelectItem value="spec-and-build">Spec & Build</SelectItem>
+                        <SelectItem value="full-sdd">Full SDD</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleInitializeWorkflow(workflowTemplate)}
+                      disabled={workflowBusy}
+                      className="h-7 px-2.5 text-xs"
+                    >
+                      Init Active
+                    </Button>
                   </div>
                 )}
               </div>
@@ -1549,35 +1691,15 @@ const ChatInterface: React.FC<Props> = ({
           </div>
           <div className="px-6 pb-6 pt-4">
             <div className="mx-auto max-w-4xl">
-              <div className="relative rounded-md border border-border bg-white shadow-lg dark:border-border dark:bg-card">
-                <div className="flex items-center gap-2 rounded-md px-4 py-3">
-                  <Input
-                    className="h-9 flex-1 border-border bg-muted dark:border-border dark:bg-muted"
-                    placeholder="Send a message to this agent..."
-                    value={messageBarPrompt}
-                    onChange={(e) => setMessageBarPrompt(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        if (messageBarPrompt.trim()) {
-                          handleSendMessageBar();
-                        }
-                      }
-                    }}
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-9 border border-border bg-muted px-3 text-xs font-medium hover:bg-muted dark:border-border dark:bg-muted dark:hover:bg-muted"
-                    onClick={handleSendMessageBar}
-                    disabled={!messageBarPrompt.trim() || !conversationsLoaded}
-                    title="Send to active chat (Enter)"
-                    aria-label="Send to active chat"
-                  >
-                    <CornerDownLeft className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
+              <TaskMessageComposer
+                value={messageBarPrompt}
+                onValueChange={setMessageBarPrompt}
+                onSubmit={handleSendMessageBar}
+                placeholder="Send a message to this agent..."
+                disabled={!conversationsLoaded}
+                submitTitle="Send to active chat (Enter)"
+                submitAriaLabel="Send to active chat"
+              />
             </div>
           </div>
         </div>

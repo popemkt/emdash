@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { type Task } from '../types/chat';
 import { type Agent } from '../types';
 import { Button } from './ui/button';
-import { Input } from './ui/input';
 import { Badge } from './ui/badge';
 import OpenInMenu from './titlebar/OpenInMenu';
 import { TerminalPane } from './TerminalPane';
@@ -15,7 +14,7 @@ import { classifyActivity } from '@/lib/activityClassifier';
 import { activityStore } from '@/lib/activityStore';
 import { Spinner } from './ui/spinner';
 import { BUSY_HOLD_MS, CLEAR_BUSY_MS, INJECT_ENTER_DELAY_MS } from '@/lib/activityConstants';
-import { Check, CornerDownLeft, Pause, Play } from 'lucide-react';
+import { Check, Pause, Play } from 'lucide-react';
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
@@ -23,6 +22,8 @@ import { getTaskEnvVars } from '@shared/task/envVars';
 import { makePtyId } from '@shared/ptyId';
 import type { ProviderId } from '@shared/providers/registry';
 import type { WorkflowState, WorkflowStep, WorkflowTemplate } from '@shared/workflow/types';
+import TaskMessageComposer from './TaskMessageComposer';
+import { workflowStatusDotClass, workflowTemplateLabel } from '@/lib/workflowUi';
 
 interface Props {
   task: Task;
@@ -63,19 +64,6 @@ function getVariantChatPtyId(variant: Variant, conversationId: string): string {
   return makePtyId(variant.agent as ProviderId, 'chat', conversationId);
 }
 
-function workflowTemplateLabel(template: WorkflowTemplate): string {
-  if (template === 'full-sdd') return 'Full SDD';
-  if (template === 'spec-and-build') return 'Spec & Build';
-  return 'Simple Prompt';
-}
-
-function statusDotClass(status: WorkflowStep['status']): string {
-  if (status === 'completed') return 'bg-green-500';
-  if (status === 'blocked') return 'bg-red-500';
-  if (status === 'in_progress') return 'bg-amber-500';
-  return 'bg-muted-foreground/50';
-}
-
 const MultiAgentTask: React.FC<Props> = ({
   task,
   projectPath,
@@ -87,6 +75,7 @@ const MultiAgentTask: React.FC<Props> = ({
   const { effectiveTheme } = useTheme();
   const { toast } = useToast();
   const [prompt, setPrompt] = useState('');
+  const [promptTarget, setPromptTarget] = useState<'active' | 'all'>('all');
   const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [variantBusy, setVariantBusy] = useState<Record<string, boolean>>({});
   const [workflowByScope, setWorkflowByScope] = useState<Record<string, WorkflowState | null>>({});
@@ -635,15 +624,13 @@ const MultiAgentTask: React.FC<Props> = ({
     }, 6000);
   }
 
-  const handleRunAll = async () => {
+  const handleSendPrompt = async () => {
     const msg = prompt.trim();
     if (!msg) return;
-    // Send concurrently via PTY injection for all agents (Codex/Claude included)
-    const tasks: Promise<any>[] = [];
-    variants.forEach((v) => {
-      const termId = getVariantTerminalId(v);
-      tasks.push(injectPrompt(termId, v.agent, msg));
-    });
+    const targets = promptTarget === 'active' && activeVariant ? [activeVariant] : variants;
+    const tasks: Promise<unknown>[] = targets.map((variant) =>
+      injectPrompt(getVariantTerminalId(variant), variant.agent, msg)
+    );
     await Promise.all(tasks);
     setPrompt('');
   };
@@ -1026,7 +1013,7 @@ const MultiAgentTask: React.FC<Props> = ({
                                 }`}
                               >
                                 <span
-                                  className={`h-2 w-2 rounded-full ${statusDotClass(step.status)}`}
+                                  className={`h-2 w-2 rounded-full ${workflowStatusDotClass(step.status)}`}
                                 />
                                 <button
                                   type="button"
@@ -1245,35 +1232,32 @@ const MultiAgentTask: React.FC<Props> = ({
 
       <div className="px-6 pb-6 pt-4">
         <div className="mx-auto max-w-4xl">
-          <div className="relative rounded-md border border-border bg-white shadow-lg dark:border-border dark:bg-card">
-            <div className="flex items-center gap-2 rounded-md px-4 py-3">
-              <Input
-                className="h-9 flex-1 border-border bg-muted dark:border-border dark:bg-muted"
-                placeholder="Tell the agents what to do..."
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    if (prompt.trim()) {
-                      void handleRunAll();
-                    }
-                  }
-                }}
-              />
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-9 border border-border bg-muted px-3 text-xs font-medium hover:bg-muted dark:border-border dark:bg-muted dark:hover:bg-muted"
-                onClick={handleRunAll}
-                disabled={!prompt.trim()}
-                title="Run in all panes (Enter)"
-                aria-label="Run in all panes"
-              >
-                <CornerDownLeft className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
+          <TaskMessageComposer
+            value={prompt}
+            onValueChange={setPrompt}
+            onSubmit={() => void handleSendPrompt()}
+            placeholder={
+              promptTarget === 'active'
+                ? 'Send a message to the active agent...'
+                : 'Send a message to all agents...'
+            }
+            submitTitle={
+              promptTarget === 'active'
+                ? 'Send to active agent (Enter)'
+                : 'Send to all agents (Enter)'
+            }
+            submitAriaLabel={
+              promptTarget === 'active' ? 'Send to active agent' : 'Send to all agents'
+            }
+            mode={{
+              value: promptTarget,
+              onChange: (value) => setPromptTarget(value as 'active' | 'all'),
+              options: [
+                { value: 'all', label: 'All Agents' },
+                { value: 'active', label: 'Active Agent' },
+              ],
+            }}
+          />
         </div>
       </div>
     </div>
