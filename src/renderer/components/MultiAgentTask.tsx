@@ -89,7 +89,8 @@ const MultiAgentTask: React.FC<Props> = ({
   const [prompt, setPrompt] = useState('');
   const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [variantBusy, setVariantBusy] = useState<Record<string, boolean>>({});
-  const [activeWorkflow, setActiveWorkflow] = useState<WorkflowState | null>(null);
+  const [workflowByScope, setWorkflowByScope] = useState<Record<string, WorkflowState | null>>({});
+  const [workflowLoadingByScope, setWorkflowLoadingByScope] = useState<Record<string, boolean>>({});
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [workflowTemplate, setWorkflowTemplate] = useState<WorkflowTemplate>('simple-prompt');
   const [variantSessionConversationIds, setVariantSessionConversationIds] = useState<
@@ -99,6 +100,11 @@ const MultiAgentTask: React.FC<Props> = ({
   const variants = (multi?.variants || []) as Variant[];
   const activeVariant = variants[activeTabIndex] || null;
   const activeWorkflowScope = activeVariant ? getVariantWorkflowScope(activeVariant) : null;
+  const hasActiveWorkflowSnapshot = activeWorkflowScope
+    ? Object.prototype.hasOwnProperty.call(workflowByScope, activeWorkflowScope)
+    : false;
+  const activeWorkflow =
+    activeWorkflowScope && hasActiveWorkflowSnapshot ? workflowByScope[activeWorkflowScope] : null;
   const getVariantTerminalId = useCallback(
     (variant: Variant) => {
       const conversationId = variantSessionConversationIds[variant.worktreeId];
@@ -150,6 +156,24 @@ const MultiAgentTask: React.FC<Props> = ({
       }
       return next;
     });
+    setWorkflowByScope((prev) => {
+      const next: Record<string, WorkflowState | null> = {};
+      for (const variant of variants) {
+        const scopeKey = getVariantWorkflowScope(variant);
+        if (Object.prototype.hasOwnProperty.call(prev, scopeKey)) {
+          next[scopeKey] = prev[scopeKey] ?? null;
+        }
+      }
+      return next;
+    });
+    setWorkflowLoadingByScope((prev) => {
+      const next: Record<string, boolean> = {};
+      for (const variant of variants) {
+        const scopeKey = getVariantWorkflowScope(variant);
+        next[scopeKey] = prev[scopeKey] ?? false;
+      }
+      return next;
+    });
   }, [variants]);
 
   // Helper to generate display label with instance number if needed
@@ -175,23 +199,42 @@ const MultiAgentTask: React.FC<Props> = ({
 
   const loadActiveWorkflow = useCallback(async () => {
     if (!activeVariant || !activeWorkflowScope) {
-      setActiveWorkflow(null);
       return;
     }
+    const scopeKey = activeWorkflowScope;
+    const taskPathOverride = activeVariant.path;
+    setWorkflowLoadingByScope((prev) => ({
+      ...prev,
+      [scopeKey]: true,
+    }));
 
     try {
       const result = await window.electronAPI.workflowGet({
         taskId: task.id,
-        scopeKey: activeWorkflowScope,
-        taskPathOverride: activeVariant.path,
+        scopeKey,
+        taskPathOverride,
       });
       if (!result.success) {
-        setActiveWorkflow(null);
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [scopeKey]: null,
+        }));
         return;
       }
-      setActiveWorkflow((result.workflow as WorkflowState | null | undefined) || null);
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: (result.workflow as WorkflowState | null | undefined) || null,
+      }));
     } catch {
-      setActiveWorkflow(null);
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: null,
+      }));
+    } finally {
+      setWorkflowLoadingByScope((prev) => ({
+        ...prev,
+        [scopeKey]: false,
+      }));
     }
   }, [task.id, activeVariant, activeWorkflowScope]);
 
@@ -217,18 +260,24 @@ const MultiAgentTask: React.FC<Props> = ({
         scopeKey,
         taskPathOverride: variant.path,
       });
-      if (!result.success || !result.workflow) {
+      const createdWorkflow = result.workflow;
+      if (!result.success || !createdWorkflow) {
         throw new Error(result.error || 'Failed to initialize workflow');
       }
       setVariantSessionConversationIds((prev) => ({
         ...prev,
         [variant.worktreeId]: null,
       }));
-      if (variant.worktreeId === activeVariant?.worktreeId) {
-        setActiveWorkflow(result.workflow);
-      }
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [scopeKey]: createdWorkflow,
+      }));
+      setWorkflowLoadingByScope((prev) => ({
+        ...prev,
+        [scopeKey]: false,
+      }));
     },
-    [task.id, task.name, task.metadata?.initialPrompt, activeVariant?.worktreeId]
+    [task.id, task.name, task.metadata?.initialPrompt]
   );
 
   const handleInitWorkflowForActive = useCallback(async () => {
@@ -297,10 +346,14 @@ const MultiAgentTask: React.FC<Props> = ({
           scopeKey: activeWorkflowScope,
           taskPathOverride: activeVariant.path,
         });
-        if (!result.success || !result.workflow) {
+        const startedWorkflow = result.workflow;
+        if (!result.success || !startedWorkflow) {
           throw new Error(result.error || 'Failed to start step');
         }
-        setActiveWorkflow(result.workflow);
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [activeWorkflowScope]: startedWorkflow,
+        }));
         if (result.conversationId) {
           setVariantSessionConversationIds((prev) => ({
             ...prev,
@@ -352,7 +405,10 @@ const MultiAgentTask: React.FC<Props> = ({
           }
         }
 
-        setActiveWorkflow(nextWorkflow);
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [activeWorkflowScope]: nextWorkflow,
+        }));
       } catch (error) {
         toast({
           title: 'Workflow Error',
@@ -379,8 +435,12 @@ const MultiAgentTask: React.FC<Props> = ({
       if (!result.success) {
         throw new Error(result.error || 'Failed to start next step');
       }
-      if (result.result) {
-        setActiveWorkflow(result.result.workflow);
+      const nextStepResult = result.result;
+      if (nextStepResult) {
+        setWorkflowByScope((prev) => ({
+          ...prev,
+          [activeWorkflowScope]: nextStepResult.workflow,
+        }));
       }
     } catch (error) {
       toast({
@@ -404,10 +464,14 @@ const MultiAgentTask: React.FC<Props> = ({
         scopeKey: activeWorkflowScope,
         taskPathOverride: activeVariant.path,
       });
-      if (!result.success || !result.workflow) {
+      const updatedWorkflow = result.workflow;
+      if (!result.success || !updatedWorkflow) {
         throw new Error(result.error || 'Failed to update workflow mode');
       }
-      setActiveWorkflow(result.workflow);
+      setWorkflowByScope((prev) => ({
+        ...prev,
+        [activeWorkflowScope]: updatedWorkflow,
+      }));
     } catch (error) {
       toast({
         title: 'Workflow Error',
@@ -785,10 +849,22 @@ const MultiAgentTask: React.FC<Props> = ({
       {variants.map((v, idx) => {
         const isDark = effectiveTheme === 'dark' || effectiveTheme === 'dark-black';
         const isActive = idx === activeTabIndex;
+        const variantScopeKey = getVariantWorkflowScope(v);
+        const hasVariantWorkflowSnapshot = Object.prototype.hasOwnProperty.call(
+          workflowByScope,
+          variantScopeKey
+        );
+        const workflowForVariant =
+          isActive && hasVariantWorkflowSnapshot ? workflowByScope[variantScopeKey] : null;
+        const variantWorkflowLoading = isActive
+          ? Boolean(workflowLoadingByScope[variantScopeKey])
+          : false;
+        const showWorkflowLoadingPlaceholder =
+          isActive && variantWorkflowLoading && !hasVariantWorkflowSnapshot;
         const selectedSessionConversationId = variantSessionConversationIds[v.worktreeId] || null;
         const stepSessionOptions =
-          isActive && activeWorkflow
-            ? activeWorkflow.steps
+          isActive && workflowForVariant
+            ? workflowForVariant.steps
                 .filter((step) => Boolean(step.conversationId))
                 .sort((a, b) => a.number - b.number)
                 .map((step) => ({
@@ -813,17 +889,24 @@ const MultiAgentTask: React.FC<Props> = ({
                 />
               </div>
               <div className="px-6 pt-2">
-                <div className="mx-auto max-w-4xl rounded-md border border-border/70 bg-muted/30 p-2">
-                  {isActive && activeWorkflow ? (
+                <div className="mx-auto min-h-[132px] max-w-4xl rounded-md border border-border/70 bg-muted/30 p-2">
+                  {showWorkflowLoadingPlaceholder ? (
+                    <div className="flex min-h-[116px] items-center justify-center gap-2 text-xs text-muted-foreground">
+                      <Spinner size="sm" />
+                      Loading workflow...
+                    </div>
+                  ) : isActive && workflowForVariant ? (
                     <div className="space-y-2">
                       <div className="flex flex-wrap items-center gap-2 text-xs">
                         <span className="font-medium text-foreground">Workflow:</span>
                         <Badge variant="outline">Scope: {getVariantDisplayLabel(v)}</Badge>
                         <Badge variant="outline">
-                          {workflowTemplateLabel(activeWorkflow.type)}
+                          {workflowTemplateLabel(workflowForVariant.type)}
                         </Badge>
-                        <Badge variant="secondary">{activeWorkflow.status.replace('_', ' ')}</Badge>
-                        <Badge variant="outline">{activeWorkflow.steps.length} steps</Badge>
+                        <Badge variant="secondary">
+                          {workflowForVariant.status.replace('_', ' ')}
+                        </Badge>
+                        <Badge variant="outline">{workflowForVariant.steps.length} steps</Badge>
                         <Button
                           type="button"
                           size="sm"
@@ -832,7 +915,7 @@ const MultiAgentTask: React.FC<Props> = ({
                           onClick={() => void handleToggleWorkflowAuto()}
                           className="h-7 px-2.5 text-xs"
                         >
-                          {activeWorkflow.autoMode === 'auto' ? (
+                          {workflowForVariant.autoMode === 'auto' ? (
                             <>
                               <Pause className="mr-1.5 h-3.5 w-3.5" />
                               Auto: On
@@ -930,11 +1013,11 @@ const MultiAgentTask: React.FC<Props> = ({
                         ))}
                       </div>
                       <div className="space-y-1">
-                        {activeWorkflow.steps
+                        {workflowForVariant.steps
                           .slice()
                           .sort((a, b) => a.number - b.number)
                           .map((step) => {
-                            const isCurrent = activeWorkflow.currentStepId === step.id;
+                            const isCurrent = workflowForVariant.currentStepId === step.id;
                             return (
                               <div
                                 key={step.id}

@@ -312,8 +312,7 @@ export async function createTask(
                 .replace(/[^a-z0-9]+/g, '-')
                 .replace(/^-+|-+$/g, '') || 'default';
 
-            const featureDescription =
-              preparedPrompt?.trim() || initialPrompt?.trim() || taskName;
+            const featureDescription = preparedPrompt?.trim() || initialPrompt?.trim() || taskName;
 
             await Promise.all(
               variants.map((variant) =>
