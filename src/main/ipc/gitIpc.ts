@@ -13,12 +13,25 @@ import {
   stageAllFiles as gitStageAllFiles,
   unstageFile as gitUnstageFile,
   revertFile as gitRevertFile,
+  commit as gitCommit,
+  push as gitPush,
+  pull as gitPull,
+  getLog as gitGetLog,
+  getLatestCommit as gitGetLatestCommit,
+  getCommitFiles as gitGetCommitFiles,
+  getCommitFileDiff as gitGetCommitFileDiff,
+  softResetLastCommit as gitSoftResetLastCommit,
 } from '../services/GitService';
 import { prGenerationService } from '../services/PrGenerationService';
 import { databaseService } from '../services/DatabaseService';
 import { injectIssueFooter } from '../lib/prIssueFooter';
 import { getCreatePrBodyPlan } from '../lib/prCreateBodyPlan';
 import { patchCurrentPrBodyWithIssueFooter } from '../lib/prIssueFooterPatch';
+import { resolveRemoteProjectForWorktreePath } from '../utils/remoteProjectResolver';
+import { RemoteGitService } from '../services/RemoteGitService';
+import { sshService } from '../services/ssh/SshService';
+
+const remoteGitService = new RemoteGitService(sshService);
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -33,6 +46,80 @@ type GitStatusWatchEntry = {
 };
 
 const gitStatusWatchers = new Map<string, GitStatusWatchEntry>();
+
+// Remote polling for SSH projects (replaces fs.watch)
+const REMOTE_POLL_INTERVAL_MS = 5000;
+type RemoteStatusPollEntry = {
+  intervalId: NodeJS.Timeout;
+  watchIds: Set<string>;
+  lastStatusHash: string;
+  connectionId: string;
+};
+const remoteStatusPollers = new Map<string, RemoteStatusPollEntry>();
+
+const ensureRemoteStatusPoller = (
+  taskPath: string,
+  connectionId: string
+): { success: true; watchId: string } => {
+  const watchId = randomUUID();
+  const existing = remoteStatusPollers.get(taskPath);
+  if (existing) {
+    existing.watchIds.add(watchId);
+    return { success: true, watchId };
+  }
+
+  const entry: RemoteStatusPollEntry = {
+    intervalId: setInterval(async () => {
+      try {
+        const changes = await remoteGitService.getStatusDetailed(connectionId, taskPath);
+        // Simple hash: join paths + statuses to detect changes
+        const hash = changes.map((c) => `${c.path}:${c.status}:${c.isStaged}`).join('|');
+        const poller = remoteStatusPollers.get(taskPath);
+        if (!poller) return;
+        if (hash !== poller.lastStatusHash) {
+          poller.lastStatusHash = hash;
+          broadcastGitStatusChange(taskPath);
+        }
+      } catch {
+        // Connection may have dropped — don't crash, just skip this poll
+      }
+    }, REMOTE_POLL_INTERVAL_MS),
+    watchIds: new Set([watchId]),
+    lastStatusHash: '',
+    connectionId,
+  };
+  remoteStatusPollers.set(taskPath, entry);
+  return { success: true, watchId };
+};
+
+const releaseRemoteStatusPoller = (taskPath: string, watchId?: string) => {
+  const entry = remoteStatusPollers.get(taskPath);
+  if (!entry) return { success: true as const };
+  if (watchId) {
+    entry.watchIds.delete(watchId);
+  }
+  if (entry.watchIds.size <= 0) {
+    clearInterval(entry.intervalId);
+    remoteStatusPollers.delete(taskPath);
+  }
+  return { success: true as const };
+};
+
+/**
+ * Validate that a taskPath is an absolute path pointing to a real directory
+ * that is a git repository. Returns an error string if invalid, or null if OK.
+ */
+function validateTaskPath(taskPath: string | undefined): string | null {
+  if (!taskPath) return 'Missing taskPath';
+  if (!path.isAbsolute(taskPath)) return 'taskPath must be absolute';
+  try {
+    const stat = fs.statSync(taskPath);
+    if (!stat.isDirectory()) return 'taskPath is not a directory';
+  } catch {
+    return 'taskPath does not exist';
+  }
+  return null;
+}
 
 const broadcastGitStatusChange = (taskPath: string, error?: string) => {
   const windows = BrowserWindow.getAllWindows();
@@ -121,31 +208,466 @@ export function registerGitIpc() {
   }
   const GIT = resolveGitBin();
 
+  // Helper: commit-and-push for remote SSH projects
+  async function commitAndPushRemote(
+    connectionId: string,
+    taskPath: string,
+    opts: { commitMessage: string; createBranchIfOnDefault: boolean; branchPrefix: string }
+  ): Promise<{ success: boolean; branch?: string; output?: string; error?: string }> {
+    const { commitMessage, createBranchIfOnDefault, branchPrefix } = opts;
+
+    // Verify git repo
+    const verifyResult = await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      'rev-parse --is-inside-work-tree'
+    );
+    if (verifyResult.exitCode !== 0) {
+      return { success: false, error: 'Not a git repository' };
+    }
+
+    let activeBranch = await remoteGitService.getCurrentBranch(connectionId, taskPath);
+    const defaultBranch = await remoteGitService.getDefaultBranchName(connectionId, taskPath);
+
+    // Create feature branch if on default
+    if (createBranchIfOnDefault && (!activeBranch || activeBranch === defaultBranch)) {
+      const short = Date.now().toString(36);
+      const name = `${branchPrefix}/${short}`;
+      await remoteGitService.createBranch(connectionId, taskPath, name);
+      activeBranch = name;
+    }
+
+    // Check for changes
+    const statusResult = await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      'status --porcelain --untracked-files=all'
+    );
+    const hasWorkingChanges = Boolean(statusResult.stdout?.trim());
+
+    // Read staged files
+    const readRemoteStagedFiles = async (): Promise<string[]> => {
+      const r = await remoteGitService.execGit(connectionId, taskPath, 'diff --cached --name-only');
+      return (r.stdout || '')
+        .split('\n')
+        .map((f) => f.trim())
+        .filter(Boolean);
+    };
+
+    let stagedFiles = await readRemoteStagedFiles();
+
+    // Auto-stage if nothing staged yet
+    if (hasWorkingChanges && stagedFiles.length === 0) {
+      await remoteGitService.stageAllFiles(connectionId, taskPath);
+    }
+
+    // Unstage plan mode artifacts
+    await remoteGitService.execGit(connectionId, taskPath, 'reset -q .emdash 2>/dev/null || true');
+    await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      'reset -q PLANNING.md 2>/dev/null || true'
+    );
+    await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      'reset -q planning.md 2>/dev/null || true'
+    );
+
+    stagedFiles = await readRemoteStagedFiles();
+
+    // Commit
+    if (stagedFiles.length > 0) {
+      const commitResult = await remoteGitService.commit(connectionId, taskPath, commitMessage);
+      if (commitResult.exitCode !== 0 && !/nothing to commit/i.test(commitResult.stderr || '')) {
+        return { success: false, error: commitResult.stderr || 'Commit failed' };
+      }
+    }
+
+    // Push
+    const pushResult = await remoteGitService.push(connectionId, taskPath);
+    if (pushResult.exitCode !== 0) {
+      const retryResult = await remoteGitService.push(connectionId, taskPath, activeBranch, true);
+      if (retryResult.exitCode !== 0) {
+        return { success: false, error: retryResult.stderr || 'Push failed' };
+      }
+    }
+
+    const finalStatus = await remoteGitService.execGit(connectionId, taskPath, 'status -sb');
+    return { success: true, branch: activeBranch, output: (finalStatus.stdout || '').trim() };
+  }
+
+  // Helper: get PR status for remote SSH projects
+  async function getPrStatusRemote(
+    connectionId: string,
+    taskPath: string
+  ): Promise<{ success: boolean; pr?: any; error?: string }> {
+    const queryFields = [
+      'number',
+      'url',
+      'state',
+      'isDraft',
+      'mergeStateStatus',
+      'headRefName',
+      'baseRefName',
+      'title',
+      'author',
+      'additions',
+      'deletions',
+      'changedFiles',
+    ];
+    const fieldsStr = queryFields.join(',');
+
+    const viewResult = await remoteGitService.execGh(
+      connectionId,
+      taskPath,
+      `pr view --json ${fieldsStr} -q .`
+    );
+    let data =
+      viewResult.exitCode === 0 && viewResult.stdout.trim()
+        ? JSON.parse(viewResult.stdout.trim())
+        : null;
+
+    // Fallback: find by branch name
+    if (!data) {
+      const branch = await remoteGitService.getCurrentBranch(connectionId, taskPath);
+      if (branch) {
+        const listResult = await remoteGitService.execGh(
+          connectionId,
+          taskPath,
+          `pr list --head ${quoteGhArg(branch)} --json ${fieldsStr} --limit 1`
+        );
+        if (listResult.exitCode === 0 && listResult.stdout.trim()) {
+          const listData = JSON.parse(listResult.stdout.trim());
+          if (Array.isArray(listData) && listData.length > 0) data = listData[0];
+        }
+      }
+    }
+
+    if (!data) return { success: true, pr: null };
+
+    // Compute diff stats if missing
+    const asNumber = (v: any): number | null =>
+      typeof v === 'number' && Number.isFinite(v) ? v : null;
+    if (
+      asNumber(data.additions) === null ||
+      asNumber(data.deletions) === null ||
+      asNumber(data.changedFiles) === null
+    ) {
+      const baseRef = typeof data.baseRefName === 'string' ? data.baseRefName.trim() : '';
+      const targetRef = baseRef ? `origin/${baseRef}` : '';
+      const cmd = targetRef
+        ? `diff --shortstat ${quoteGhArg(targetRef)}...HEAD`
+        : 'diff --shortstat HEAD~1..HEAD';
+      const diffResult = await remoteGitService.execGit(connectionId, taskPath, cmd);
+      if (diffResult.exitCode === 0) {
+        const m = (diffResult.stdout || '').match(
+          /(\d+)\s+files? changed(?:,\s+(\d+)\s+insertions?\(\+\))?(?:,\s+(\d+)\s+deletions?\(-\))?/
+        );
+        if (m) {
+          if (asNumber(data.changedFiles) === null && m[1]) data.changedFiles = parseInt(m[1], 10);
+          if (asNumber(data.additions) === null && m[2]) data.additions = parseInt(m[2], 10);
+          if (asNumber(data.deletions) === null && m[3]) data.deletions = parseInt(m[3], 10);
+        }
+      }
+    }
+
+    return { success: true, pr: data };
+  }
+
+  // Helper: create PR for remote SSH projects
+  async function createPrRemote(
+    connectionId: string,
+    taskPath: string,
+    opts: {
+      title?: string;
+      body?: string;
+      base?: string;
+      head?: string;
+      draft?: boolean;
+      web?: boolean;
+      fill?: boolean;
+    }
+  ): Promise<{ success: boolean; url?: string; output?: string; error?: string; code?: string }> {
+    const { title, body, base, head, draft, web, fill } = opts;
+    const outputs: string[] = [];
+
+    // Enrich body with issue footer
+    let prBody = body;
+    try {
+      const task = await databaseService.getTaskByPath(taskPath);
+      prBody = injectIssueFooter(body, task?.metadata);
+    } catch {
+      // Non-fatal
+    }
+
+    const {
+      shouldPatchFilledBody,
+      shouldUseBodyFile: _unused,
+      shouldUseFill,
+    } = getCreatePrBodyPlan({
+      fill,
+      title,
+      rawBody: body,
+      enrichedBody: prBody,
+    });
+
+    // Stage and commit pending changes
+    const statusResult = await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      'status --porcelain --untracked-files=all'
+    );
+    if (statusResult.stdout?.trim()) {
+      await remoteGitService.stageAllFiles(connectionId, taskPath);
+      const commitResult = await remoteGitService.commit(
+        connectionId,
+        taskPath,
+        'stagehand: prepare pull request'
+      );
+      if (commitResult.exitCode !== 0 && !/nothing to commit/i.test(commitResult.stderr || '')) {
+        outputs.push(commitResult.stderr || '');
+      }
+    }
+
+    // Push branch
+    const pushResult = await remoteGitService.push(connectionId, taskPath);
+    if (pushResult.exitCode !== 0) {
+      const branch = await remoteGitService.getCurrentBranch(connectionId, taskPath);
+      const retryResult = await remoteGitService.push(connectionId, taskPath, branch, true);
+      if (retryResult.exitCode !== 0) {
+        return {
+          success: false,
+          error:
+            'Failed to push branch to origin. Please check your Git remotes and authentication.',
+        };
+      }
+    }
+    outputs.push('git push: success');
+
+    // Resolve branches
+    const currentBranch = await remoteGitService.getCurrentBranch(connectionId, taskPath);
+    const defaultBranch = await remoteGitService.getDefaultBranchName(connectionId, taskPath);
+
+    // Validate commits ahead
+    const baseRef = base || defaultBranch;
+    const aheadResult = await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      `rev-list --count origin/${quoteGhArg(baseRef)}..HEAD`
+    );
+    const aheadCount = parseInt((aheadResult.stdout || '0').trim(), 10) || 0;
+    if (aheadCount <= 0) {
+      return {
+        success: false,
+        error: `No commits to create a PR. Make a commit on current branch '${currentBranch}' ahead of base '${baseRef}'.`,
+      };
+    }
+
+    // Build gh pr create command
+    const flags: string[] = [];
+    if (title) flags.push(`--title ${quoteGhArg(title)}`);
+    // Can't use --body-file on remote, use --body instead
+    if (prBody && !shouldUseFill) flags.push(`--body ${quoteGhArg(prBody)}`);
+    flags.push(`--base ${quoteGhArg(baseRef)}`);
+    if (head) {
+      flags.push(`--head ${quoteGhArg(head)}`);
+    } else if (currentBranch) {
+      flags.push(`--head ${quoteGhArg(currentBranch)}`);
+    }
+    if (draft) flags.push('--draft');
+    if (web) flags.push('--web');
+    if (shouldUseFill) flags.push('--fill');
+
+    const createResult = await remoteGitService.execGh(
+      connectionId,
+      taskPath,
+      `pr create ${flags.join(' ')}`
+    );
+
+    const combined = [createResult.stdout, createResult.stderr].filter(Boolean).join('\n').trim();
+    const urlMatch = combined.match(/https?:\/\/\S+/);
+    const url = urlMatch ? urlMatch[0] : null;
+
+    if (createResult.exitCode !== 0) {
+      const restrictionRe =
+        /Auth App access restrictions|authorized OAuth apps|third-parties is limited/i;
+      const prExistsRe = /already exists|already has.*pull request|pull request for branch/i;
+      let code: string | undefined;
+      if (restrictionRe.test(combined)) code = 'ORG_AUTH_APP_RESTRICTED';
+      else if (prExistsRe.test(combined)) code = 'PR_ALREADY_EXISTS';
+      return { success: false, error: combined, output: combined, code };
+    }
+
+    // Patch body if needed
+    if (shouldPatchFilledBody && url) {
+      try {
+        const task = await databaseService.getTaskByPath(taskPath);
+        if (task?.metadata) {
+          const editBody = injectIssueFooter(undefined, task.metadata);
+          if (editBody) {
+            await remoteGitService.execGh(
+              connectionId,
+              taskPath,
+              `pr edit --body ${quoteGhArg(editBody)}`
+            );
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    const out = [...outputs, combined].filter(Boolean).join('\n');
+    return { success: true, url: url || undefined, output: out };
+  }
+
+  // Helper: merge-to-main for remote SSH projects
+  async function mergeToMainRemote(
+    connectionId: string,
+    taskPath: string
+  ): Promise<{ success: boolean; prUrl?: string; error?: string }> {
+    const currentBranch = await remoteGitService.getCurrentBranch(connectionId, taskPath);
+    const defaultBranch = await remoteGitService.getDefaultBranchName(connectionId, taskPath);
+
+    if (!currentBranch) {
+      return { success: false, error: 'Not on a branch (detached HEAD state).' };
+    }
+    if (currentBranch === defaultBranch) {
+      return {
+        success: false,
+        error: `Already on ${defaultBranch}. Create a feature branch first.`,
+      };
+    }
+
+    // Stage and commit pending changes
+    const statusResult = await remoteGitService.execGit(
+      connectionId,
+      taskPath,
+      'status --porcelain --untracked-files=all'
+    );
+    if (statusResult.stdout?.trim()) {
+      await remoteGitService.stageAllFiles(connectionId, taskPath);
+      const commitResult = await remoteGitService.commit(
+        connectionId,
+        taskPath,
+        'chore: prepare for merge to main'
+      );
+      if (commitResult.exitCode !== 0 && !/nothing to commit/i.test(commitResult.stderr || '')) {
+        throw new Error(commitResult.stderr || 'Commit failed');
+      }
+    }
+
+    // Push
+    const pushResult = await remoteGitService.push(connectionId, taskPath);
+    if (pushResult.exitCode !== 0) {
+      const retryResult = await remoteGitService.push(connectionId, taskPath, currentBranch, true);
+      if (retryResult.exitCode !== 0) {
+        throw new Error(retryResult.stderr || 'Push failed');
+      }
+    }
+
+    // Create PR
+    let prUrl = '';
+    const createResult = await remoteGitService.execGh(
+      connectionId,
+      taskPath,
+      `pr create --fill --base ${quoteGhArg(defaultBranch)}`
+    );
+    const urlMatch = (createResult.stdout || '').match(/https?:\/\/\S+/);
+    prUrl = urlMatch ? urlMatch[0] : '';
+
+    if (createResult.exitCode !== 0) {
+      if (!/already exists|already has.*pull request/i.test(createResult.stderr || '')) {
+        return { success: false, error: `Failed to create PR: ${createResult.stderr}` };
+      }
+    }
+
+    // Patch PR body with issue footer
+    try {
+      const task = await databaseService.getTaskByPath(taskPath);
+      if (task?.metadata) {
+        const footer = injectIssueFooter(undefined, task.metadata);
+        if (footer) {
+          await remoteGitService.execGh(
+            connectionId,
+            taskPath,
+            `pr edit --body ${quoteGhArg(footer)}`
+          );
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+
+    // Merge
+    const mergeResult = await remoteGitService.execGh(connectionId, taskPath, 'pr merge --merge');
+    if (mergeResult.exitCode !== 0) {
+      return {
+        success: false,
+        error: `PR created but merge failed: ${mergeResult.stderr}`,
+        prUrl,
+      };
+    }
+    return { success: true, prUrl };
+  }
+
+  // Helper: escape arguments for gh CLI commands run over SSH
+  function quoteGhArg(arg: string): string {
+    // Use the same POSIX single-quote wrapping as quoteShellArg for consistency
+    return `'${arg.replace(/'/g, "'\\''")}'`;
+  }
+
   ipcMain.handle('git:watch-status', async (_, taskPath: string) => {
+    const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+    if (remoteProject) {
+      return ensureRemoteStatusPoller(taskPath, remoteProject.sshConnectionId);
+    }
     return ensureGitStatusWatcher(taskPath);
   });
 
   ipcMain.handle('git:unwatch-status', async (_, taskPath: string, watchId?: string) => {
+    const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+    if (remoteProject) {
+      return releaseRemoteStatusPoller(taskPath, watchId);
+    }
     return releaseGitStatusWatcher(taskPath, watchId);
   });
 
   // Git: Status (moved from Codex IPC)
   ipcMain.handle('git:get-status', async (_, taskPath: string) => {
     try {
+      const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+      if (remoteProject) {
+        const changes = await remoteGitService.getStatusDetailed(
+          remoteProject.sshConnectionId,
+          taskPath
+        );
+        return { success: true, changes };
+      }
       const changes = await gitGetStatus(taskPath);
       return { success: true, changes };
     } catch (error) {
-      return { success: false, error: error as string };
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
 
   // Git: Per-file diff (moved from Codex IPC)
   ipcMain.handle('git:get-file-diff', async (_, args: { taskPath: string; filePath: string }) => {
     try {
+      const remoteProject = await resolveRemoteProjectForWorktreePath(args.taskPath);
+      if (remoteProject) {
+        const diff = await remoteGitService.getFileDiff(
+          remoteProject.sshConnectionId,
+          args.taskPath,
+          args.filePath
+        );
+        return { success: true, diff };
+      }
       const diff = await gitGetFileDiff(args.taskPath, args.filePath);
       return { success: true, diff };
     } catch (error) {
-      return { success: false, error: error as string };
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
 
@@ -153,7 +675,16 @@ export function registerGitIpc() {
   ipcMain.handle('git:stage-file', async (_, args: { taskPath: string; filePath: string }) => {
     try {
       log.info('Staging file:', { taskPath: args.taskPath, filePath: args.filePath });
-      await gitStageFile(args.taskPath, args.filePath);
+      const remoteProject = await resolveRemoteProjectForWorktreePath(args.taskPath);
+      if (remoteProject) {
+        await remoteGitService.stageFile(
+          remoteProject.sshConnectionId,
+          args.taskPath,
+          args.filePath
+        );
+      } else {
+        await gitStageFile(args.taskPath, args.filePath);
+      }
       log.info('File staged successfully:', args.filePath);
       return { success: true };
     } catch (error) {
@@ -166,7 +697,12 @@ export function registerGitIpc() {
   ipcMain.handle('git:stage-all-files', async (_, args: { taskPath: string }) => {
     try {
       log.info('Staging all files:', { taskPath: args.taskPath });
-      await gitStageAllFiles(args.taskPath);
+      const remoteProject = await resolveRemoteProjectForWorktreePath(args.taskPath);
+      if (remoteProject) {
+        await remoteGitService.stageAllFiles(remoteProject.sshConnectionId, args.taskPath);
+      } else {
+        await gitStageAllFiles(args.taskPath);
+      }
       log.info('All files staged successfully');
       return { success: true };
     } catch (error) {
@@ -179,7 +715,16 @@ export function registerGitIpc() {
   ipcMain.handle('git:unstage-file', async (_, args: { taskPath: string; filePath: string }) => {
     try {
       log.info('Unstaging file:', { taskPath: args.taskPath, filePath: args.filePath });
-      await gitUnstageFile(args.taskPath, args.filePath);
+      const remoteProject = await resolveRemoteProjectForWorktreePath(args.taskPath);
+      if (remoteProject) {
+        await remoteGitService.unstageFile(
+          remoteProject.sshConnectionId,
+          args.taskPath,
+          args.filePath
+        );
+      } else {
+        await gitUnstageFile(args.taskPath, args.filePath);
+      }
       log.info('File unstaged successfully:', args.filePath);
       return { success: true };
     } catch (error) {
@@ -192,7 +737,17 @@ export function registerGitIpc() {
   ipcMain.handle('git:revert-file', async (_, args: { taskPath: string; filePath: string }) => {
     try {
       log.info('Reverting file:', { taskPath: args.taskPath, filePath: args.filePath });
-      const result = await gitRevertFile(args.taskPath, args.filePath);
+      const remoteProject = await resolveRemoteProjectForWorktreePath(args.taskPath);
+      let result: { action: string };
+      if (remoteProject) {
+        result = await remoteGitService.revertFile(
+          remoteProject.sshConnectionId,
+          args.taskPath,
+          args.filePath
+        );
+      } else {
+        result = await gitRevertFile(args.taskPath, args.filePath);
+      }
       log.info('File operation completed:', { filePath: args.filePath, action: result.action });
       return { success: true, action: result.action };
     } catch (error) {
@@ -212,6 +767,37 @@ export function registerGitIpc() {
     ) => {
       const { taskPath, base = 'main' } = args || ({} as { taskPath: string; base?: string });
       try {
+        // For remote projects, PR content generation still runs locally — it just needs
+        // the diff text. The prGenerationService can get diff data via the now-remote-aware
+        // git:get-status and git:get-file-diff handlers, or we pass the taskPath which the
+        // service uses with local git commands. For remote, we get the diff over SSH and
+        // pass it to the generation service.
+        const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+        if (remoteProject) {
+          const connId = remoteProject.sshConnectionId;
+          // Get diff text over SSH
+          const diffResult = await remoteGitService.execGit(
+            connId,
+            taskPath,
+            `diff --stat origin/${quoteGhArg(base)}...HEAD`
+          );
+          const logResult = await remoteGitService.execGit(
+            connId,
+            taskPath,
+            `log --oneline origin/${quoteGhArg(base)}..HEAD`
+          );
+          const diffText = (diffResult.stdout || '').trim();
+          const logText = (logResult.stdout || '').trim();
+          // Use simple title/description generation from diff summary
+          const lines = logText.split('\n').filter((l) => l.trim());
+          const generatedTitle = lines.length === 1 ? lines[0].replace(/^[a-f0-9]+ /, '') : '';
+          return {
+            success: true,
+            title: generatedTitle,
+            description: diffText ? `## Changes\n\n\`\`\`\n${diffText}\n\`\`\`` : '',
+          };
+        }
+
         // Try to get the task to find which provider was used
         let providerId: string | null = null;
         try {
@@ -266,6 +852,19 @@ export function registerGitIpc() {
           fill?: boolean;
         });
       try {
+        const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+        if (remoteProject) {
+          return await createPrRemote(remoteProject.sshConnectionId, taskPath, {
+            title,
+            body,
+            base,
+            head,
+            draft,
+            web,
+            fill,
+          });
+        }
+
         const outputs: string[] = [];
         let taskMetadata: unknown = undefined;
         let prBody = body;
@@ -344,32 +943,6 @@ export function registerGitIpc() {
           }
         }
 
-        // Resolve repo owner/name (prefer gh, fallback to parsing origin url)
-        let repoNameWithOwner = '';
-        try {
-          const { stdout: repoOut } = await execAsync(
-            'gh repo view --json nameWithOwner -q .nameWithOwner',
-            { cwd: taskPath }
-          );
-          repoNameWithOwner = (repoOut || '').trim();
-        } catch {
-          try {
-            const { stdout: urlOut } = await execAsync('git remote get-url origin', {
-              cwd: taskPath,
-            });
-            const url = (urlOut || '').trim();
-            // Handle both SSH and HTTPS forms
-            const m =
-              url.match(/github\.com[/:]([^/]+)\/([^/.]+)(?:\.git)?$/i) ||
-              url.match(/([^/:]+)[:/]([^/]+)\/([^/.]+)(?:\.git)?$/i);
-            if (m) {
-              const owner = m[1].includes('github.com') ? m[1].split('github.com').pop() : m[1];
-              const repo = m[2] || m[3];
-              repoNameWithOwner = `${owner}/${repo}`.replace(/^\/*/, '');
-            }
-          } catch {}
-        }
-
         // Determine current branch and default base branch (fallback to main)
         let currentBranch = '';
         try {
@@ -414,9 +987,8 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
           // Non-fatal; continue
         }
 
-        // Build gh pr create command with explicit repo/base/head for reliability
+        // Build gh pr create command
         const flags: string[] = [];
-        if (repoNameWithOwner) flags.push(`--repo ${JSON.stringify(repoNameWithOwner)}`);
         if (title) flags.push(`--title ${JSON.stringify(title)}`);
 
         // Use temp file for body to properly handle newlines and multiline content
@@ -443,11 +1015,7 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
         if (head) {
           flags.push(`--head ${JSON.stringify(head)}`);
         } else if (currentBranch) {
-          // Prefer owner:branch form when repo is known; otherwise branch name
-          const headRef = repoNameWithOwner
-            ? `${repoNameWithOwner.split('/')[0]}:${currentBranch}`
-            : currentBranch;
-          flags.push(`--head ${JSON.stringify(headRef)}`);
+          flags.push(`--head ${JSON.stringify(currentBranch)}`);
         }
         if (draft) flags.push('--draft');
         if (web) flags.push('--web');
@@ -536,6 +1104,11 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
   ipcMain.handle('git:get-pr-status', async (_, args: { taskPath: string }) => {
     const { taskPath } = args || ({} as { taskPath: string });
     try {
+      const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+      if (remoteProject) {
+        return await getPrStatusRemote(remoteProject.sshConnectionId, taskPath);
+      }
+
       // Ensure we're in a git repo
       await execAsync('git rev-parse --is-inside-work-tree', { cwd: taskPath });
 
@@ -630,7 +1203,7 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
         return { success: false, error: msg || 'Failed to query PR status' };
       }
     } catch (error) {
-      return { success: false, error: error as string };
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
 
@@ -659,6 +1232,33 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
       };
 
       try {
+        const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+        if (remoteProject) {
+          const strategyFlag =
+            strategy === 'squash' ? '--squash' : strategy === 'rebase' ? '--rebase' : '--merge';
+          const ghArgs = ['pr', 'merge'];
+          if (typeof prNumber === 'number' && Number.isFinite(prNumber))
+            ghArgs.push(String(prNumber));
+          ghArgs.push(strategyFlag);
+          if (admin) ghArgs.push('--admin');
+          const result = await remoteGitService.execGh(
+            remoteProject.sshConnectionId,
+            taskPath,
+            ghArgs.join(' ')
+          );
+          if (result.exitCode !== 0) {
+            const msg = (result.stderr || '') + (result.stdout || '');
+            if (/not installed|command not found/i.test(msg)) {
+              return { success: false, error: msg, code: 'GH_CLI_UNAVAILABLE' };
+            }
+            return { success: false, error: msg || 'Failed to merge PR' };
+          }
+          return {
+            success: true,
+            output: [result.stdout, result.stderr].filter(Boolean).join('\n').trim(),
+          };
+        }
+
         await execFileAsync(GIT, ['rev-parse', '--is-inside-work-tree'], { cwd: taskPath });
 
         const strategyFlag =
@@ -686,7 +1286,7 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
           return { success: false, error: combined || 'Failed to merge PR' };
         }
       } catch (error) {
-        return { success: false, error: error as string };
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
       }
     }
   );
@@ -695,6 +1295,61 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
   ipcMain.handle('git:get-check-runs', async (_, args: { taskPath: string }) => {
     const { taskPath } = args || ({} as { taskPath: string });
     try {
+      const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+      if (remoteProject) {
+        const connId = remoteProject.sshConnectionId;
+        const fields = 'bucket,completedAt,description,event,link,name,startedAt,state,workflow';
+        const checksResult = await remoteGitService.execGh(
+          connId,
+          taskPath,
+          `pr checks --json ${fields}`
+        );
+        if (checksResult.exitCode !== 0) {
+          const msg = checksResult.stderr || '';
+          if (/no pull requests? found/i.test(msg) || /not found/i.test(msg)) {
+            return { success: true, checks: null };
+          }
+          if (/not installed|command not found/i.test(msg)) {
+            return { success: false, error: msg, code: 'GH_CLI_UNAVAILABLE' };
+          }
+          return { success: false, error: msg || 'Failed to query check runs' };
+        }
+        const checks = checksResult.stdout.trim() ? JSON.parse(checksResult.stdout.trim()) : [];
+
+        // Fetch html_url from API
+        try {
+          const shaResult = await remoteGitService.execGh(
+            connId,
+            taskPath,
+            "pr view --json headRefOid --jq '.headRefOid'"
+          );
+          const sha = shaResult.stdout.trim();
+          if (sha) {
+            const apiResult = await remoteGitService.execGh(
+              connId,
+              taskPath,
+              `api repos/{owner}/{repo}/commits/${sha}/check-runs --jq '.check_runs | map({name: .name, html_url: .html_url}) | .[]'`
+            );
+            const urlMap = new Map<string, string>();
+            for (const line of apiResult.stdout.trim().split('\n')) {
+              if (!line) continue;
+              try {
+                const entry = JSON.parse(line);
+                if (entry.name && entry.html_url) urlMap.set(entry.name, entry.html_url);
+              } catch {}
+            }
+            for (const check of checks) {
+              const htmlUrl = urlMap.get(check.name);
+              if (htmlUrl) check.link = htmlUrl;
+            }
+          }
+        } catch {
+          // Fall back to original link values
+        }
+
+        return { success: true, checks };
+      }
+
       await execFileAsync(GIT, ['rev-parse', '--is-inside-work-tree'], { cwd: taskPath });
 
       const fields = 'bucket,completedAt,description,event,link,name,startedAt,state,workflow';
@@ -754,7 +1409,7 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
         return { success: false, error: msg || 'Failed to query check runs' };
       }
     } catch (error) {
-      return { success: false, error: error as string };
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
 
@@ -764,6 +1419,78 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
     async (_, args: { taskPath: string; prNumber?: number }) => {
       const { taskPath, prNumber } = args || ({} as { taskPath: string; prNumber?: number });
       try {
+        const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+        if (remoteProject) {
+          const connId = remoteProject.sshConnectionId;
+          const ghViewArgs = prNumber
+            ? `pr view ${prNumber} --json comments,reviews,number`
+            : 'pr view --json comments,reviews,number';
+          const viewResult = await remoteGitService.execGh(connId, taskPath, ghViewArgs);
+          if (viewResult.exitCode !== 0) {
+            const msg = viewResult.stderr || '';
+            if (/no pull requests? found/i.test(msg) || /not found/i.test(msg)) {
+              return { success: true, comments: [], reviews: [] };
+            }
+            if (/not installed|command not found/i.test(msg)) {
+              return { success: false, error: msg, code: 'GH_CLI_UNAVAILABLE' };
+            }
+            return { success: false, error: msg || 'Failed to query PR comments' };
+          }
+          const data = viewResult.stdout.trim()
+            ? JSON.parse(viewResult.stdout.trim())
+            : { comments: [], reviews: [], number: 0 };
+          const comments = data.comments || [];
+          const reviews = data.reviews || [];
+
+          // Fetch avatar URLs via REST API
+          if (data.number) {
+            try {
+              const avatarMap = new Map<string, string>();
+              const setAvatar = (login: string, url: string) => {
+                avatarMap.set(login, url);
+                if (login.endsWith('[bot]')) avatarMap.set(login.replace(/\[bot]$/, ''), url);
+              };
+
+              const commentsApi = await remoteGitService.execGh(
+                connId,
+                taskPath,
+                `api repos/{owner}/{repo}/issues/${data.number}/comments --jq '.[] | {login: .user.login, avatar_url: .user.avatar_url}'`
+              );
+              for (const line of commentsApi.stdout.trim().split('\n')) {
+                if (!line) continue;
+                try {
+                  const entry = JSON.parse(line);
+                  if (entry.login && entry.avatar_url) setAvatar(entry.login, entry.avatar_url);
+                } catch {}
+              }
+
+              const reviewsApi = await remoteGitService.execGh(
+                connId,
+                taskPath,
+                `api repos/{owner}/{repo}/pulls/${data.number}/reviews --jq '.[] | {login: .user.login, avatar_url: .user.avatar_url}'`
+              );
+              for (const line of reviewsApi.stdout.trim().split('\n')) {
+                if (!line) continue;
+                try {
+                  const entry = JSON.parse(line);
+                  if (entry.login && entry.avatar_url) setAvatar(entry.login, entry.avatar_url);
+                } catch {}
+              }
+
+              for (const c of [...comments, ...reviews]) {
+                if (c.author?.login) {
+                  const avatarUrl = avatarMap.get(c.author.login);
+                  if (avatarUrl) c.author.avatarUrl = avatarUrl;
+                }
+              }
+            } catch {
+              // Fall back to no avatar URLs
+            }
+          }
+
+          return { success: true, comments, reviews };
+        }
+
         await execFileAsync(GIT, ['rev-parse', '--is-inside-work-tree'], { cwd: taskPath });
 
         try {
@@ -849,7 +1576,7 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
           return { success: false, error: msg || 'Failed to query PR comments' };
         }
       } catch (error) {
-        return { success: false, error: error as string };
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
       }
     }
   );
@@ -885,6 +1612,16 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
       };
 
       try {
+        const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+
+        if (remoteProject) {
+          return await commitAndPushRemote(remoteProject.sshConnectionId, taskPath, {
+            commitMessage,
+            createBranchIfOnDefault,
+            branchPrefix,
+          });
+        }
+
         // Ensure we're in a git repo
         await execAsync('git rev-parse --is-inside-work-tree', { cwd: taskPath });
 
@@ -1003,8 +1740,26 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
   ipcMain.handle('git:get-branch-status', async (_, args: { taskPath: string }) => {
     const { taskPath } = args || ({} as { taskPath: string });
 
-    // Early exit for missing/invalid path
-    if (!taskPath || !fs.existsSync(taskPath)) {
+    if (!taskPath) {
+      return { success: false, error: 'Path does not exist' };
+    }
+
+    const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+    if (remoteProject) {
+      try {
+        const status = await remoteGitService.getBranchStatus(
+          remoteProject.sshConnectionId,
+          taskPath
+        );
+        return { success: true, ...status };
+      } catch (error) {
+        log.error(`getBranchStatus (remote): error for ${taskPath}:`, error);
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    // Early exit for missing/invalid local path
+    if (!fs.existsSync(taskPath)) {
       log.warn(`getBranchStatus: path does not exist: ${taskPath}`);
       return { success: false, error: 'Path does not exist' };
     }
@@ -1048,36 +1803,66 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
         } catch {}
       }
 
-      // Ahead/behind relative to upstream or origin/<default>
+      // Ahead/behind relative to upstream tracking branch
       let ahead = 0;
       let behind = 0;
       try {
-        // Try explicit compare with origin/default...HEAD
+        // Best case: compare against the upstream tracking branch (@{upstream})
         const { stdout } = await execFileAsync(
           GIT,
-          ['rev-list', '--left-right', '--count', `origin/${defaultBranch}...HEAD`],
+          ['rev-list', '--left-right', '--count', '@{upstream}...HEAD'],
           { cwd: taskPath }
         );
         const parts = (stdout || '').trim().split(/\s+/);
         if (parts.length >= 2) {
-          behind = parseInt(parts[0] || '0', 10) || 0; // commits on left (origin/default)
-          ahead = parseInt(parts[1] || '0', 10) || 0; // commits on right (HEAD)
+          behind = parseInt(parts[0] || '0', 10) || 0;
+          ahead = parseInt(parts[1] || '0', 10) || 0;
         }
       } catch {
         try {
-          const { stdout } = await execFileAsync(GIT, ['status', '-sb'], { cwd: taskPath });
-          const line = (stdout || '').split(/\n/)[0] || '';
-          const m = line.match(/ahead\s+(\d+)/i);
-          const n = line.match(/behind\s+(\d+)/i);
-          if (m) ahead = parseInt(m[1] || '0', 10) || 0;
-          if (n) behind = parseInt(n[1] || '0', 10) || 0;
-        } catch {}
+          // Fallback: compare against origin/<current-branch>
+          const { stdout } = await execFileAsync(
+            GIT,
+            ['rev-list', '--left-right', '--count', `origin/${branch}...HEAD`],
+            { cwd: taskPath }
+          );
+          const parts = (stdout || '').trim().split(/\s+/);
+          if (parts.length >= 2) {
+            behind = parseInt(parts[0] || '0', 10) || 0;
+            ahead = parseInt(parts[1] || '0', 10) || 0;
+          }
+        } catch {
+          // No upstream — use git status as last resort
+          try {
+            const { stdout } = await execFileAsync(GIT, ['status', '-sb'], { cwd: taskPath });
+            const line = (stdout || '').split(/\n/)[0] || '';
+            const m = line.match(/ahead\s+(\d+)/i);
+            const n = line.match(/behind\s+(\d+)/i);
+            if (m) ahead = parseInt(m[1] || '0', 10) || 0;
+            if (n) behind = parseInt(n[1] || '0', 10) || 0;
+          } catch {}
+        }
       }
 
-      return { success: true, branch, defaultBranch, ahead, behind };
+      // Count commits ahead of origin/<defaultBranch> (for PR visibility)
+      let aheadOfDefault = 0;
+      if (branch !== defaultBranch) {
+        try {
+          const { stdout: countOut } = await execFileAsync(
+            GIT,
+            ['rev-list', '--count', `origin/${defaultBranch}..HEAD`],
+            { cwd: taskPath }
+          );
+          aheadOfDefault = parseInt(countOut.trim(), 10) || 0;
+        } catch {
+          // origin/<defaultBranch> may not exist
+        }
+      }
+
+      return { success: true, branch, defaultBranch, ahead, behind, aheadOfDefault };
     } catch (error) {
       log.error(`getBranchStatus: unexpected error for ${taskPath}:`, error);
-      return { success: false, error: error as string };
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
 
@@ -1088,6 +1873,22 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
       if (!projectPath) {
         return { success: false, error: 'projectPath is required' };
       }
+
+      const remoteProject = await resolveRemoteProjectForWorktreePath(projectPath);
+      if (remoteProject) {
+        try {
+          const branches = await remoteGitService.listBranches(
+            remoteProject.sshConnectionId,
+            projectPath,
+            remote
+          );
+          return { success: true, branches };
+        } catch (error) {
+          log.error('Failed to list branches (remote):', error);
+          return { success: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
+
       try {
         await execAsync('git rev-parse --is-inside-work-tree', { cwd: projectPath });
       } catch {
@@ -1098,11 +1899,11 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
         // Check if remote exists before attempting to fetch
         let hasRemote = false;
         try {
-          await execAsync(`git remote get-url ${remote}`, { cwd: projectPath });
+          await execFileAsync('git', ['remote', 'get-url', remote], { cwd: projectPath });
           hasRemote = true;
           // Remote exists, try to fetch
           try {
-            await execAsync(`git fetch --prune ${remote}`, { cwd: projectPath });
+            await execFileAsync('git', ['fetch', '--prune', remote], { cwd: projectPath });
           } catch (fetchError) {
             log.warn('Failed to fetch remote before listing branches', fetchError);
           }
@@ -1115,8 +1916,9 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
 
         if (hasRemote) {
           // List remote branches
-          const { stdout } = await execAsync(
-            `git for-each-ref --format="%(refname:short)" refs/remotes/${remote}`,
+          const { stdout } = await execFileAsync(
+            'git',
+            ['for-each-ref', '--format=%(refname:short)', `refs/remotes/${remote}`],
             { cwd: projectPath }
           );
 
@@ -1200,6 +2002,11 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
     const { taskPath } = args || ({} as { taskPath: string });
 
     try {
+      const remoteProject = await resolveRemoteProjectForWorktreePath(taskPath);
+      if (remoteProject) {
+        return await mergeToMainRemote(remoteProject.sshConnectionId, taskPath);
+      }
+
       // Get current and default branch names
       const { stdout: currentOut } = await execAsync('git branch --show-current', {
         cwd: taskPath,
@@ -1326,6 +2133,17 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
       try {
         log.info('Renaming branch:', { repoPath, oldBranch, newBranch });
 
+        const remoteProject = await resolveRemoteProjectForWorktreePath(repoPath);
+        if (remoteProject) {
+          const result = await remoteGitService.renameBranch(
+            remoteProject.sshConnectionId,
+            repoPath,
+            oldBranch,
+            newBranch
+          );
+          return { success: true, remotePushed: result.remotePushed };
+        }
+
         // Check remote tracking BEFORE rename (git branch -m renames config section)
         let remotePushed = false;
         let remoteName = 'origin';
@@ -1385,4 +2203,115 @@ current branch '${currentBranch}' ahead of base '${baseRef}'.`,
       }
     }
   );
+
+  ipcMain.handle('git:commit', async (_, args: { taskPath: string; message: string }) => {
+    try {
+      const pathErr = validateTaskPath(args.taskPath);
+      if (pathErr) return { success: false, error: pathErr };
+      const result = await gitCommit(args.taskPath, args.message);
+      broadcastGitStatusChange(args.taskPath);
+      return { success: true, hash: result.hash };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('git:push', async (_, args: { taskPath: string }) => {
+    try {
+      const pathErr = validateTaskPath(args.taskPath);
+      if (pathErr) return { success: false, error: pathErr };
+      const result = await gitPush(args.taskPath);
+      return { success: true, output: result.output };
+    } catch (error) {
+      const errObj = error as { stderr?: string; message?: string };
+      return { success: false, error: errObj?.stderr?.trim() || errObj?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('git:pull', async (_, args: { taskPath: string }) => {
+    try {
+      const pathErr = validateTaskPath(args.taskPath);
+      if (pathErr) return { success: false, error: pathErr };
+      const result = await gitPull(args.taskPath);
+      return { success: true, output: result.output };
+    } catch (error) {
+      const errObj = error as { stderr?: string; message?: string };
+      return { success: false, error: errObj?.stderr?.trim() || errObj?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle(
+    'git:get-log',
+    async (
+      _,
+      args: { taskPath: string; maxCount?: number; skip?: number; aheadCount?: number }
+    ) => {
+      try {
+        const pathErr = validateTaskPath(args.taskPath);
+        if (pathErr) return { success: false, error: pathErr };
+        const result = await gitGetLog(args.taskPath, args.maxCount, args.skip, args.aheadCount);
+        return { success: true, commits: result.commits, aheadCount: result.aheadCount };
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
+
+  ipcMain.handle('git:get-latest-commit', async (_, args: { taskPath: string }) => {
+    try {
+      const pathErr = validateTaskPath(args.taskPath);
+      if (pathErr) return { success: false, error: pathErr };
+      const commit = await gitGetLatestCommit(args.taskPath);
+      return { success: true, commit };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle(
+    'git:get-commit-files',
+    async (_, args: { taskPath: string; commitHash: string }) => {
+      try {
+        const pathErr = validateTaskPath(args.taskPath);
+        if (pathErr) return { success: false, error: pathErr };
+        if (!/^[0-9a-f]{4,40}$/i.test(args.commitHash)) {
+          return { success: false, error: 'Invalid commit hash' };
+        }
+        const files = await gitGetCommitFiles(args.taskPath, args.commitHash);
+        return { success: true, files };
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
+
+  ipcMain.handle(
+    'git:get-commit-file-diff',
+    async (_, args: { taskPath: string; commitHash: string; filePath: string }) => {
+      try {
+        const pathErr = validateTaskPath(args.taskPath);
+        if (pathErr) return { success: false, error: pathErr };
+        if (!/^[0-9a-f]{4,40}$/i.test(args.commitHash)) {
+          return { success: false, error: 'Invalid commit hash' };
+        }
+        // filePath is validated by path.resolve check in GitService.getCommitFileDiff
+        const diff = await gitGetCommitFileDiff(args.taskPath, args.commitHash, args.filePath);
+        return { success: true, diff };
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
+
+  ipcMain.handle('git:soft-reset', async (_, args: { taskPath: string }) => {
+    try {
+      const pathErr = validateTaskPath(args.taskPath);
+      if (pathErr) return { success: false, error: pathErr };
+      const result = await gitSoftResetLastCommit(args.taskPath);
+      broadcastGitStatusChange(args.taskPath);
+      return { success: true, subject: result.subject, body: result.body };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
 }

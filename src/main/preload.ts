@@ -28,6 +28,9 @@ function attachGitStatusBridgeOnce() {
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('electronAPI', {
+  // Generic invoke for the typed RPC client (createRPCClient)
+  invoke: (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args),
+
   // App info
   getAppVersion: () => ipcRenderer.invoke('app:getAppVersion'),
   getElectronVersion: () => ipcRenderer.invoke('app:getElectronVersion'),
@@ -90,6 +93,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ptyResize: (args: { id: string; cols: number; rows: number }) =>
     ipcRenderer.send('pty:resize', args),
   ptyKill: (id: string) => ipcRenderer.send('pty:kill', { id }),
+  ptyKillTmux: (id: string) =>
+    ipcRenderer.invoke('pty:killTmux', { id }) as Promise<{ ok: boolean; error?: string }>,
 
   // Direct PTY spawn (no shell wrapper, bypasses shell config loading)
   ptyStartDirect: (opts: {
@@ -142,11 +147,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on(channel, wrapped);
     return () => ipcRenderer.removeListener(channel, wrapped);
   },
+  onNotificationFocusTask: (listener: (taskId: string) => void) => {
+    const channel = 'notification:focus-task';
+    const wrapped = (_: Electron.IpcRendererEvent, taskId: string) => listener(taskId);
+    ipcRenderer.on(channel, wrapped);
+    return () => ipcRenderer.removeListener(channel, wrapped);
+  },
   terminalGetTheme: () => ipcRenderer.invoke('terminal:getTheme'),
-
-  // App settings
-  getSettings: () => ipcRenderer.invoke('settings:get'),
-  updateSettings: (settings: any) => ipcRenderer.invoke('settings:update', settings),
 
   // Menu events (main → renderer)
   onMenuOpenSettings: (listener: () => void) => {
@@ -169,6 +176,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onMenuRedo: (listener: () => void) => {
     const channel = 'menu:redo';
+    const wrapped = () => listener();
+    ipcRenderer.on(channel, wrapped);
+    return () => ipcRenderer.removeListener(channel, wrapped);
+  },
+  onMenuCloseTab: (listener: () => void) => {
+    const channel = 'menu:close-tab';
     const wrapped = () => listener();
     ipcRenderer.on(channel, wrapped);
     return () => ipcRenderer.removeListener(channel, wrapped);
@@ -234,6 +247,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   lifecycleTeardown: (args: { taskId: string; taskPath: string; projectPath: string }) =>
     ipcRenderer.invoke('lifecycle:teardown', args),
   lifecycleGetState: (args: { taskId: string }) => ipcRenderer.invoke('lifecycle:getState', args),
+  lifecycleGetLogs: (args: { taskId: string }) => ipcRenderer.invoke('lifecycle:getLogs', args),
   lifecycleClearTask: (args: { taskId: string }) => ipcRenderer.invoke('lifecycle:clearTask', args),
   onLifecycleEvent: (listener: (data: any) => void) => {
     const wrapped = (_: Electron.IpcRendererEvent, data: any) => listener(data);
@@ -296,6 +310,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Project management
   openProject: () => ipcRenderer.invoke('project:open'),
+  openFile: (args?: { title?: string; message?: string; filters?: Electron.FileFilter[] }) =>
+    ipcRenderer.invoke('project:openFile', args),
   getProjectSettings: (projectId: string) =>
     ipcRenderer.invoke('projectSettings:get', { projectId }),
   updateProjectSettings: (args: { projectId: string; baseRef: string }) =>
@@ -323,6 +339,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('git:unstage-file', args),
   revertFile: (args: { taskPath: string; filePath: string }) =>
     ipcRenderer.invoke('git:revert-file', args),
+  gitCommit: (args: { taskPath: string; message: string }) =>
+    ipcRenderer.invoke('git:commit', args),
+  gitPush: (args: { taskPath: string }) => ipcRenderer.invoke('git:push', args),
+  gitPull: (args: { taskPath: string }) => ipcRenderer.invoke('git:pull', args),
+  gitGetLog: (args: { taskPath: string; maxCount?: number; skip?: number }) =>
+    ipcRenderer.invoke('git:get-log', args),
+  gitGetLatestCommit: (args: { taskPath: string }) =>
+    ipcRenderer.invoke('git:get-latest-commit', args),
+  gitGetCommitFiles: (args: { taskPath: string; commitHash: string }) =>
+    ipcRenderer.invoke('git:get-commit-files', args),
+  gitGetCommitFileDiff: (args: { taskPath: string; commitHash: string; filePath: string }) =>
+    ipcRenderer.invoke('git:get-commit-file-diff', args),
+  gitSoftReset: (args: { taskPath: string }) => ipcRenderer.invoke('git:soft-reset', args),
   gitCommitAndPush: (args: {
     taskPath: string;
     commitMessage?: string;
@@ -475,39 +504,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAllProviderCustomConfigs: () => ipcRenderer.invoke('providers:getAllCustomConfigs'),
   updateProviderCustomConfig: (providerId: string, config: any) =>
     ipcRenderer.invoke('providers:updateCustomConfig', providerId, config),
-  // Database methods
-  getProjects: () => ipcRenderer.invoke('db:getProjects'),
-  saveProject: (project: any) => ipcRenderer.invoke('db:saveProject', project),
-  getTasks: (projectId?: string) => ipcRenderer.invoke('db:getTasks', projectId),
-  saveTask: (task: any) => ipcRenderer.invoke('db:saveTask', task),
-  deleteProject: (projectId: string) => ipcRenderer.invoke('db:deleteProject', projectId),
-  deleteTask: (taskId: string) => ipcRenderer.invoke('db:deleteTask', taskId),
-  archiveTask: (taskId: string) => ipcRenderer.invoke('db:archiveTask', taskId),
-  restoreTask: (taskId: string) => ipcRenderer.invoke('db:restoreTask', taskId),
-  getArchivedTasks: (projectId?: string) => ipcRenderer.invoke('db:getArchivedTasks', projectId),
-
-  // Conversation management
-  saveConversation: (conversation: any) => ipcRenderer.invoke('db:saveConversation', conversation),
-  getConversations: (taskId: string) => ipcRenderer.invoke('db:getConversations', taskId),
-  getOrCreateDefaultConversation: (taskId: string) =>
-    ipcRenderer.invoke('db:getOrCreateDefaultConversation', taskId),
-  saveMessage: (message: any) => ipcRenderer.invoke('db:saveMessage', message),
-  getMessages: (conversationId: string) => ipcRenderer.invoke('db:getMessages', conversationId),
-  deleteConversation: (conversationId: string) =>
-    ipcRenderer.invoke('db:deleteConversation', conversationId),
-  cleanupSessionDirectory: (args: { taskPath: string; conversationId: string }) =>
-    ipcRenderer.invoke('db:cleanupSessionDirectory', args),
-
-  // Multi-chat support
-  createConversation: (params: { taskId: string; title: string; provider?: string }) =>
-    ipcRenderer.invoke('db:createConversation', params),
-  setActiveConversation: (params: { taskId: string; conversationId: string }) =>
-    ipcRenderer.invoke('db:setActiveConversation', params),
-  getActiveConversation: (taskId: string) => ipcRenderer.invoke('db:getActiveConversation', taskId),
-  reorderConversations: (params: { taskId: string; conversationIds: string[] }) =>
-    ipcRenderer.invoke('db:reorderConversations', params),
-  updateConversationTitle: (params: { conversationId: string; title: string }) =>
-    ipcRenderer.invoke('db:updateConversationTitle', params),
 
   // Line comments management
   lineCommentsCreate: (input: any) => ipcRenderer.invoke('lineComments:create', input),
@@ -1050,54 +1046,6 @@ export interface ElectronAPI {
   githubLogout: () => Promise<void>;
   githubCheckCLIInstalled: () => Promise<boolean>;
   githubInstallCLI: () => Promise<{ success: boolean; error?: string }>;
-
-  // Database methods
-  getProjects: () => Promise<any[]>;
-  saveProject: (project: any) => Promise<{ success: boolean; error?: string }>;
-  getTasks: (projectId?: string) => Promise<any[]>;
-  saveTask: (task: any) => Promise<{ success: boolean; error?: string }>;
-  deleteProject: (projectId: string) => Promise<{ success: boolean; error?: string }>;
-  deleteTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-
-  // Conversation management
-  saveConversation: (conversation: any) => Promise<{ success: boolean; error?: string }>;
-  getConversations: (
-    taskId: string
-  ) => Promise<{ success: boolean; conversations?: any[]; error?: string }>;
-  getOrCreateDefaultConversation: (
-    taskId: string
-  ) => Promise<{ success: boolean; conversation?: any; error?: string }>;
-  saveMessage: (message: any) => Promise<{ success: boolean; error?: string }>;
-  getMessages: (
-    conversationId: string
-  ) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
-  deleteConversation: (conversationId: string) => Promise<{ success: boolean; error?: string }>;
-  cleanupSessionDirectory: (args: {
-    taskPath: string;
-    conversationId: string;
-  }) => Promise<{ success: boolean }>;
-
-  // Multi-chat support
-  createConversation: (params: {
-    taskId: string;
-    title: string;
-    provider?: string;
-  }) => Promise<{ success: boolean; conversation?: any; error?: string }>;
-  setActiveConversation: (params: {
-    taskId: string;
-    conversationId: string;
-  }) => Promise<{ success: boolean; error?: string }>;
-  getActiveConversation: (
-    taskId: string
-  ) => Promise<{ success: boolean; conversation?: any; error?: string }>;
-  reorderConversations: (params: {
-    taskId: string;
-    conversationIds: string[];
-  }) => Promise<{ success: boolean; error?: string }>;
-  updateConversationTitle: (params: {
-    conversationId: string;
-    title: string;
-  }) => Promise<{ success: boolean; error?: string }>;
 
   // Host preview (non-container)
   hostPreviewStart: (args: {

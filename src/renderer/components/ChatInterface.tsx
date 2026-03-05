@@ -9,7 +9,6 @@ import { agentMeta } from '../providers/meta';
 import { agentConfig } from '../lib/agentConfig';
 import AgentLogo from './AgentLogo';
 import TaskContextBadges from './TaskContextBadges';
-import { Badge } from './ui/badge';
 import { Spinner } from './ui/spinner';
 import { useInitialPromptInjection } from '../hooks/useInitialPromptInjection';
 import { useTaskComments } from '../hooks/useLineComments';
@@ -17,15 +16,18 @@ import { type Agent } from '../types';
 import { Task } from '../types/chat';
 import { useTaskTerminals } from '@/lib/taskTerminalsStore';
 import { activityStore } from '@/lib/activityStore';
+import { rpc } from '@/lib/rpc';
 import { getInstallCommandForProvider } from '@shared/providers/registry';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { TaskScopeProvider } from './TaskScopeContext';
 import { CreateChatModal } from './CreateChatModal';
-import { DeleteChatModal } from './DeleteChatModal';
 import { type Conversation } from '../../main/services/DatabaseService';
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { makePtyId } from '@shared/ptyId';
+import { generateTaskName } from '../lib/branchNameGenerator';
+import { ensureUniqueTaskName } from '../lib/taskNames';
+import type { Project } from '../types/app';
 
 declare const window: Window & {
   electronAPI: {
@@ -35,6 +37,7 @@ declare const window: Window & {
 
 interface Props {
   task: Task;
+  project?: Project | null;
   projectName: string;
   projectPath?: string | null;
   projectRemoteConnectionId?: string | null;
@@ -43,10 +46,12 @@ interface Props {
   className?: string;
   initialAgent?: Agent;
   onTaskInterfaceReady?: () => void;
+  onRenameTask?: (project: Project, task: Task, newName: string) => Promise<void>;
 }
 
 const ChatInterface: React.FC<Props> = ({
   task,
+  project,
   projectName: _projectName,
   projectPath,
   projectRemoteConnectionId,
@@ -55,6 +60,7 @@ const ChatInterface: React.FC<Props> = ({
   className,
   initialAgent,
   onTaskInterfaceReady,
+  onRenameTask,
 }) => {
   const { effectiveTheme } = useTheme();
   const { toast } = useToast();
@@ -71,8 +77,6 @@ const ChatInterface: React.FC<Props> = ({
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
   const [showCreateChatModal, setShowCreateChatModal] = useState(false);
-  const [showDeleteChatModal, setShowDeleteChatModal] = useState(false);
-  const [chatToDelete, setChatToDelete] = useState<string | null>(null);
   const [busyByConversationId, setBusyByConversationId] = useState<Record<string, boolean>>({});
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
@@ -164,13 +168,13 @@ const ChatInterface: React.FC<Props> = ({
   useEffect(() => {
     const loadConversations = async () => {
       setConversationsLoaded(false);
-      const result = await window.electronAPI.getConversations(task.id);
+      const loadedConversations = await rpc.db.getConversations(task.id);
 
-      if (result.success && result.conversations && result.conversations.length > 0) {
-        setConversations(result.conversations);
+      if (loadedConversations.length > 0) {
+        setConversations(loadedConversations);
 
         // Set active conversation
-        const active = result.conversations.find((c: Conversation) => c.isActive);
+        const active = loadedConversations.find((c: Conversation) => c.isActive);
         if (active) {
           setActiveConversationId(active.id);
           // Update agent to match the active conversation
@@ -179,13 +183,13 @@ const ChatInterface: React.FC<Props> = ({
           }
         } else {
           // Fallback to first conversation
-          const firstConv = result.conversations[0];
+          const firstConv = loadedConversations[0];
           setActiveConversationId(firstConv.id);
           // Update agent to match the first conversation
           if (firstConv.provider) {
             setAgent(firstConv.provider as Agent);
           }
-          await window.electronAPI.setActiveConversation({
+          await rpc.db.setActiveConversation({
             taskId: task.id,
             conversationId: firstConv.id,
           });
@@ -195,25 +199,25 @@ const ChatInterface: React.FC<Props> = ({
         // No conversations exist - create default for backward compatibility
         // This ensures existing tasks always have at least one conversation
         // (preserves pre-multi-chat behavior)
-        const defaultResult = await window.electronAPI.getOrCreateDefaultConversation(task.id);
-        if (defaultResult.success && defaultResult.conversation) {
+        const defaultConversation = await rpc.db.getOrCreateDefaultConversation(task.id);
+        if (defaultConversation) {
           // For backward compatibility: use task.agentId if available, otherwise use current agent
           // This preserves the original agent choice for tasks created before multi-chat
           const taskAgent = task.agentId || agent;
           const conversationWithAgent = {
-            ...defaultResult.conversation,
+            ...defaultConversation,
             provider: taskAgent,
             isMain: true,
             isActive: true,
           };
           setConversations([conversationWithAgent]);
-          setActiveConversationId(defaultResult.conversation.id);
+          setActiveConversationId(defaultConversation.id);
 
           // Update the agent state to match
           setAgent(taskAgent as Agent);
 
           // Save the agent to the conversation
-          await window.electronAPI.saveConversation(conversationWithAgent);
+          await rpc.db.saveConversation(conversationWithAgent);
           setConversationsLoaded(true);
         }
       }
@@ -277,6 +281,7 @@ const ChatInterface: React.FC<Props> = ({
 
   // Auto-focus terminal when switching to this task
   useEffect(() => {
+    if (!conversationsLoaded) return;
     // Small delay to ensure terminal is mounted and attached
     const timer = setTimeout(() => {
       const session = terminalSessionRegistry.getSession(terminalId);
@@ -285,7 +290,7 @@ const ChatInterface: React.FC<Props> = ({
       }
     }, 100);
     return () => clearTimeout(timer);
-  }, [task.id, terminalId]);
+  }, [task.id, terminalId, conversationsLoaded]);
 
   // Focus terminal when this task becomes active (for already-mounted terminals)
   useEffect(() => {
@@ -445,50 +450,34 @@ const ChatInterface: React.FC<Props> = ({
       try {
         // Don't dispose the current terminal - each chat has its own independent session
 
-        const result = await window.electronAPI.createConversation({
+        const newConversation = await rpc.db.createConversation({
           taskId: task.id,
           title,
           provider: newAgent,
           isMain: false, // Additional chats are never main
         });
 
-        if (result.success && result.conversation) {
-          // Reload conversations from DB
-          const conversationsResult = await window.electronAPI.getConversations(task.id);
-          if (conversationsResult.success && conversationsResult.conversations) {
-            const dbConversations = conversationsResult.conversations;
-            const dbIds = new Set(dbConversations.map((c: Conversation) => c.id));
-            const missingFromDb = conversations.filter((c) => !dbIds.has(c.id));
-            if (missingFromDb.length > 0) {
-              // Re-persist conversations that only existed in React state
-              for (const missing of missingFromDb) {
-                await window.electronAPI.saveConversation({ ...missing, isActive: false });
-              }
-              const retryResult = await window.electronAPI.getConversations(task.id);
-              setConversations(
-                retryResult.success && retryResult.conversations
-                  ? retryResult.conversations
-                  : [...missingFromDb, ...dbConversations]
-              );
-            } else {
-              setConversations(dbConversations);
-            }
+        // Reload conversations from DB
+        const dbConversations = await rpc.db.getConversations(task.id);
+        const dbIds = new Set(dbConversations.map((c: Conversation) => c.id));
+        const missingFromDb = conversations.filter((c) => !dbIds.has(c.id));
+        if (missingFromDb.length > 0) {
+          // Re-persist conversations that only existed in React state
+          for (const missing of missingFromDb) {
+            await rpc.db.saveConversation({ ...missing, isActive: false });
           }
-          setActiveConversationId(result.conversation.id);
-          setAgent(newAgent as Agent);
-          try {
-            window.dispatchEvent(
-              new CustomEvent('emdash:conversations-changed', { detail: { taskId: task.id } })
-            );
-          } catch {}
+          const retryConversations = await rpc.db.getConversations(task.id);
+          setConversations(retryConversations);
         } else {
-          console.error('Failed to create conversation:', result.error);
-          toast({
-            title: 'Error',
-            description: result.error || 'Failed to create chat',
-            variant: 'destructive',
-          });
+          setConversations(dbConversations);
         }
+        setActiveConversationId(newConversation.id);
+        setAgent(newAgent as Agent);
+        try {
+          window.dispatchEvent(
+            new CustomEvent('emdash:conversations-changed', { detail: { taskId: task.id } })
+          );
+        } catch {}
       } catch (error) {
         console.error('Exception creating conversation:', error);
         toast({
@@ -510,7 +499,7 @@ const ChatInterface: React.FC<Props> = ({
       // Don't dispose terminals - just switch between them
       // Each chat maintains its own persistent terminal session
 
-      await window.electronAPI.setActiveConversation({
+      await rpc.db.setActiveConversation({
         taskId: task.id,
         conversationId,
       });
@@ -526,7 +515,7 @@ const ChatInterface: React.FC<Props> = ({
   );
 
   const handleCloseChat = useCallback(
-    (conversationId: string) => {
+    async (conversationId: string) => {
       if (conversations.length <= 1) {
         toast({
           title: 'Cannot Close',
@@ -536,37 +525,21 @@ const ChatInterface: React.FC<Props> = ({
         return;
       }
 
-      // Show the delete confirmation modal
-      setChatToDelete(conversationId);
-      setShowDeleteChatModal(true);
-    },
-    [conversations.length, toast]
-  );
+      // Dispose the terminal for this chat
+      const convToDelete = conversations.find((c) => c.id === conversationId);
+      const convAgent = (convToDelete?.provider || agent) as Agent;
+      const terminalToDispose = makePtyId(convAgent, 'chat', conversationId);
+      terminalSessionRegistry.dispose(terminalToDispose);
 
-  const handleConfirmDeleteChat = useCallback(async () => {
-    if (!chatToDelete) return;
+      await rpc.db.deleteConversation(conversationId);
 
-    // Only dispose the terminal when actually deleting the chat
-    // Find the conversation to get its provider
-    const convToDelete = conversations.find((c) => c.id === chatToDelete);
-    const convAgent = (convToDelete?.provider || agent) as Agent;
-    const terminalToDispose = makePtyId(convAgent, 'chat', chatToDelete);
-    terminalSessionRegistry.dispose(terminalToDispose);
-
-    await window.electronAPI.deleteConversation(chatToDelete);
-
-    // Reload conversations
-    const result = await window.electronAPI.getConversations(task.id);
-    if (result.success) {
-      setConversations(result.conversations || []);
+      // Reload conversations
+      const updatedConversations = await rpc.db.getConversations(task.id);
+      setConversations(updatedConversations);
       // Switch to another chat if we deleted the active one
-      if (
-        chatToDelete === activeConversationId &&
-        result.conversations &&
-        result.conversations.length > 0
-      ) {
-        const newActive = result.conversations[0];
-        await window.electronAPI.setActiveConversation({
+      if (conversationId === activeConversationId && updatedConversations.length > 0) {
+        const newActive = updatedConversations[0];
+        await rpc.db.setActiveConversation({
           taskId: task.id,
           conversationId: newActive.id,
         });
@@ -576,18 +549,15 @@ const ChatInterface: React.FC<Props> = ({
           setAgent(newActive.provider as Agent);
         }
       }
-    }
 
-    try {
-      window.dispatchEvent(
-        new CustomEvent('emdash:conversations-changed', { detail: { taskId: task.id } })
-      );
-    } catch {}
-
-    // Clear the state
-    setChatToDelete(null);
-    setShowDeleteChatModal(false);
-  }, [chatToDelete, conversations, agent, task.id, activeConversationId]);
+      try {
+        window.dispatchEvent(
+          new CustomEvent('emdash:conversations-changed', { detail: { taskId: task.id } })
+        );
+      } catch {}
+    },
+    [conversations, agent, task.id, activeConversationId, toast]
+  );
 
   // Persist last-selected agent per task (including Droid)
   useEffect(() => {
@@ -722,6 +692,17 @@ const ChatInterface: React.FC<Props> = ({
       window.removeEventListener('emdash:switch-agent', handleAgentSwitch);
     };
   }, [conversations, activeConversationId, handleSwitchChat]);
+
+  // Close active chat tab on Cmd+W
+  useEffect(() => {
+    const handleCloseActiveChat = () => {
+      if (activeConversationId) {
+        handleCloseChat(activeConversationId);
+      }
+    };
+    window.addEventListener('emdash:close-active-chat', handleCloseActiveChat);
+    return () => window.removeEventListener('emdash:close-active-chat', handleCloseActiveChat);
+  }, [activeConversationId, handleCloseChat]);
 
   const isTerminal = agentMeta[agent]?.terminalOnly === true;
   const autoApproveEnabled =
@@ -870,6 +851,33 @@ const ChatInterface: React.FC<Props> = ({
     } catch {}
   }, [agent, task.id]);
 
+  // Auto-rename task from first terminal message (only if name was auto-generated)
+  const handleFirstMessage = useCallback(
+    (message: string) => {
+      if (!project || !onRenameTask) return;
+      // Only rename if this task's name was auto-generated
+      if (!task.metadata?.nameGenerated) return;
+      // Skip multi-agent tasks
+      if (task.metadata?.multiAgent?.enabled) return;
+
+      const generated = generateTaskName(message);
+      if (!generated) return;
+
+      const existingNames = (project.tasks || []).map((t) => t.name);
+      const uniqueName = ensureUniqueTaskName(generated, existingNames);
+      void onRenameTask(project, task, uniqueName);
+    },
+    [project, task, onRenameTask]
+  );
+
+  // Whether to enable first-message capture for this task
+  const shouldCaptureFirstMessage = !!(
+    task.metadata?.nameGenerated &&
+    !task.metadata?.multiAgent?.enabled &&
+    project &&
+    onRenameTask
+  );
+
   if (!isTerminal) {
     return null;
   }
@@ -884,16 +892,6 @@ const ChatInterface: React.FC<Props> = ({
           onClose={() => setShowCreateChatModal(false)}
           onCreateChat={handleCreateChat}
           installedAgents={installedAgents}
-        />
-
-        <DeleteChatModal
-          open={showDeleteChatModal}
-          onOpenChange={setShowDeleteChatModal}
-          onConfirm={handleConfirmDeleteChat}
-          onCancel={() => {
-            setChatToDelete(null);
-            setShowDeleteChatModal(false);
-          }}
         />
 
         <div className="flex min-h-0 flex-1 flex-col">
@@ -1090,7 +1088,7 @@ const ChatInterface: React.FC<Props> = ({
                     setCliStartError(null);
                     // Mark initial injection as sent so it won't re-run on restart
                     if (initialInjection && !task.metadata?.initialInjectionSent) {
-                      void window.electronAPI.saveTask({
+                      void rpc.db.saveTask({
                         ...task,
                         metadata: {
                           ...task.metadata,
@@ -1147,6 +1145,7 @@ const ChatInterface: React.FC<Props> = ({
                       ? (initialInjection ?? undefined)
                       : undefined
                   }
+                  onFirstMessage={shouldCaptureFirstMessage ? handleFirstMessage : undefined}
                   className="h-full w-full"
                 />
               )}

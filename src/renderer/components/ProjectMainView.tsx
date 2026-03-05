@@ -45,6 +45,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/t
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { isActivePr, PrInfo } from '../lib/prStatus';
 import { refreshPrStatus } from '../lib/prStatusStore';
+import { rpc } from '../lib/rpc';
 import { useTaskBusy } from '../hooks/useTaskBusy';
 import { useTaskAgentNames } from '../hooks/useTaskAgentNames';
 import AgentLogo from './AgentLogo';
@@ -52,6 +53,7 @@ import { agentAssets } from '../providers/assets';
 import { getProvider } from '@shared/providers/registry';
 import type { ProviderId } from '@shared/providers/registry';
 import type { Project, Task } from '../types/app';
+import { useTaskManagementContext } from '../contexts/TaskManagementContext';
 
 const normalizeBaseRef = (ref?: string | null): string | undefined => {
   if (!ref) return undefined;
@@ -315,6 +317,7 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
   onBaseBranchChange: onBaseBranchChangeCallback,
 }) => {
   const { toast } = useToast();
+  const { tasksByProjectId } = useTaskManagementContext();
 
   const [baseBranch, setBaseBranch] = useState<string | undefined>(() =>
     normalizeBaseRef(project.gitInfo.baseRef)
@@ -327,22 +330,21 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isArchiving, setIsArchiving] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
   const [acknowledgeDirtyDelete, setAcknowledgeDirtyDelete] = useState(false);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [searchFilter, setSearchFilter] = useState('');
   const [showFilter, setShowFilter] = useState<'active' | 'all'>('active');
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
 
-  const activeTasks = project.tasks ?? [];
+  const activeTasks = tasksByProjectId[project.id] ?? [];
   const activeTasksLength = activeTasks.length;
 
   const refetchArchivedTasks = useCallback(() => {
     const timeoutId = setTimeout(async () => {
       try {
-        const result = await window.electronAPI.getArchivedTasks(project.id);
-        if (Array.isArray(result)) {
-          setArchivedTasks(result);
-        }
+        const archivedTasks = (await rpc.db.getArchivedTasks(project.id)) as Task[];
+        setArchivedTasks(archivedTasks);
       } catch {
         //
       }
@@ -373,6 +375,18 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
     () => tasksInProject.filter((ws) => selectedIds.has(ws.id)),
     [selectedIds, tasksInProject]
   );
+
+  // Determine which bulk actions to show
+  const bulkActionState = useMemo(() => {
+    const archivedCount = selectedTasks.filter((t) => t.archivedAt).length;
+    const activeCount = selectedTasks.length - archivedCount;
+    return {
+      hasArchived: archivedCount > 0,
+      hasActive: activeCount > 0,
+      archivedCount,
+      activeCount,
+    };
+  }, [selectedTasks]);
 
   // Calculate select all checkbox state
   const allFilteredSelected =
@@ -509,7 +523,7 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
 
   const handleBulkArchive = async () => {
     if (!onArchiveTask) return;
-    const toArchive = tasksInProject.filter((ws) => selectedIds.has(ws.id));
+    const toArchive = tasksInProject.filter((ws) => selectedIds.has(ws.id) && !ws.archivedAt);
     if (toArchive.length === 0) return;
 
     setIsArchiving(true);
@@ -541,6 +555,44 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
         title: archivedNames.length === 1 ? 'Task archived' : 'Tasks archived',
         description: remaining > 0 ? `${displayNames} and ${remaining} more` : displayNames,
       });
+    }
+  };
+
+  const handleBulkRestore = async () => {
+    const toRestore = tasksInProject.filter((ws) => selectedIds.has(ws.id) && ws.archivedAt);
+    if (toRestore.length === 0) return;
+
+    setIsRestoring(true);
+
+    const restoredNames: string[] = [];
+    for (const ws of toRestore) {
+      try {
+        if (onRestoreTask) {
+          await onRestoreTask(project, ws);
+        } else {
+          await rpc.db.restoreTask(ws.id);
+        }
+        setArchivedTasks((prev) => prev.filter((t) => t.id !== ws.id));
+        restoredNames.push(ws.name);
+      } catch {
+        // Continue restoring remaining tasks
+      }
+    }
+
+    setIsRestoring(false);
+    exitSelectMode();
+
+    if (restoredNames.length > 0) {
+      const maxNames = 3;
+      const displayNames = restoredNames.slice(0, maxNames).join(', ');
+      const remaining = restoredNames.length - maxNames;
+
+      toast({
+        title: restoredNames.length === 1 ? 'Task restored' : 'Tasks restored',
+        description: remaining > 0 ? `${displayNames} and ${remaining} more` : displayNames,
+      });
+    } else {
+      toast({ title: 'Failed to restore tasks', variant: 'destructive' });
     }
   };
 
@@ -576,8 +628,7 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
         if (onRestoreTask) {
           await onRestoreTask(project, task);
         } else {
-          const result = await window.electronAPI.restoreTask(task.id);
-          if (!result?.success) throw new Error(result?.error);
+          await rpc.db.restoreTask(task.id);
         }
         setArchivedTasks((prev) => prev.filter((t) => t.id !== task.id));
         toast({ title: 'Task restored', description: task.name });
@@ -764,7 +815,7 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
                   {onDeleteProject ? (
                     <ProjectDeleteButton
                       projectName={project.name}
-                      tasks={project.tasks}
+                      tasks={activeTasks}
                       onConfirm={() => onDeleteProject?.(project)}
                       aria-label={`Delete project ${project.name}`}
                     />
@@ -818,28 +869,68 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
                         <span className="text-sm text-muted-foreground">
                           {selectedCount} selected
                         </span>
-                        {onArchiveTask && (
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            className="text-muted-foreground"
-                            onClick={handleBulkArchive}
-                            disabled={isArchiving || isDeleting || selectedCount === 0}
-                            aria-label="Archive selected"
-                          >
-                            {isArchiving ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <Archive className="h-3.5 w-3.5" />
-                            )}
-                          </Button>
+                        {onArchiveTask && bulkActionState.hasActive && (
+                          <TooltipProvider delayDuration={300}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  className="text-muted-foreground"
+                                  onClick={handleBulkArchive}
+                                  disabled={
+                                    isArchiving || isDeleting || isRestoring || selectedCount === 0
+                                  }
+                                  aria-label="Archive selected"
+                                >
+                                  {isArchiving ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <Archive className="h-3.5 w-3.5" />
+                                  )}
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="top" className="text-xs">
+                                Archive {bulkActionState.activeCount}{' '}
+                                {bulkActionState.activeCount === 1 ? 'task' : 'tasks'}
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        )}
+                        {bulkActionState.hasArchived && (
+                          <TooltipProvider delayDuration={300}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  className="text-muted-foreground"
+                                  onClick={handleBulkRestore}
+                                  disabled={
+                                    isArchiving || isDeleting || isRestoring || selectedCount === 0
+                                  }
+                                  aria-label="Unarchive selected"
+                                >
+                                  {isRestoring ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <ArchiveRestore className="h-3.5 w-3.5" />
+                                  )}
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="top" className="text-xs">
+                                Unarchive {bulkActionState.archivedCount}{' '}
+                                {bulkActionState.archivedCount === 1 ? 'task' : 'tasks'}
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         )}
                         <Button
                           variant="ghost"
                           size="icon-sm"
                           className="text-muted-foreground"
                           onClick={() => setShowDeleteDialog(true)}
-                          disabled={isDeleting || isArchiving || selectedCount === 0}
+                          disabled={isDeleting || isArchiving || isRestoring || selectedCount === 0}
                           aria-label="Delete selected"
                         >
                           {isDeleting ? (

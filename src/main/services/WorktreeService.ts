@@ -231,10 +231,11 @@ export class WorktreeService {
         baseRefInfo
       );
 
-      // Create the worktree
+      // Create the worktree with --no-track to prevent auto-tracking base ref
+      // Tracking is set explicitly via push --set-upstream after creation
       const { stdout, stderr } = await execFileAsync(
         'git',
-        ['worktree', 'add', '-b', branchName, worktreePath, fetchedBaseRef.fullRef],
+        ['worktree', 'add', '--no-track', '-b', branchName, worktreePath, fetchedBaseRef.fullRef],
         { cwd: projectPath }
       );
 
@@ -820,7 +821,14 @@ export class WorktreeService {
           branch: target.branch,
           fullRef: target.branch,
         };
-      } catch (error) {
+      } catch (error: any) {
+        if (
+          error?.code === 'ENAMETOOLONG' ||
+          error?.code === 'ENOENT' ||
+          error?.code === 'EACCES'
+        ) {
+          throw new Error(`Git failed to run (${error.code}). Check app logs for details.`);
+        }
         throw new Error(`Local branch '${target.branch}' does not exist. Please create it first.`);
       }
     }
@@ -889,7 +897,10 @@ export class WorktreeService {
         cwd: projectPath,
       });
       return true;
-    } catch {
+    } catch (error: any) {
+      if (error?.code === 'ENAMETOOLONG' || error?.code === 'ENOENT' || error?.code === 'EACCES') {
+        throw error;
+      }
       return false;
     }
   }

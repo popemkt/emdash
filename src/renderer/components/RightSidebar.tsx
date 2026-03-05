@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { cn } from '@/lib/utils';
 import FileChangesPanel from './FileChangesPanel';
-import { useFileChanges } from '@/hooks/useFileChanges';
 import TaskTerminalPanel from './TaskTerminalPanel';
 import { useRightSidebar } from './ui/right-sidebar';
 import { agentAssets } from '@/providers/assets';
@@ -30,6 +29,7 @@ interface RightSidebarProps extends React.HTMLAttributes<HTMLElement> {
   projectRemotePath?: string | null;
   projectDefaultBranch?: string | null;
   forceBorder?: boolean;
+  onOpenChanges?: (filePath?: string, taskPath?: string) => void;
 }
 
 const RightSidebar: React.FC<RightSidebarProps> = ({
@@ -40,6 +40,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({
   projectDefaultBranch,
   className,
   forceBorder = false,
+  onOpenChanges,
   ...rest
 }) => {
   const { collapsed } = useRightSidebar();
@@ -194,7 +195,11 @@ const RightSidebar: React.FC<RightSidebarProps> = ({
                           <TaskScopeProvider
                             value={{ taskId: task.id, taskPath: v.path, projectPath }}
                           >
-                            <VariantChangesIfAny path={v.path} taskId={task.id} />
+                            <VariantChangesIfAny
+                              path={v.path}
+                              taskId={task.id}
+                              onOpenChanges={onOpenChanges}
+                            />
                             <TaskTerminalPanel
                               task={{
                                 ...task,
@@ -239,6 +244,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({
                           path={v.path}
                           taskId={task.id}
                           className="h-full min-h-0"
+                          onOpenChanges={onOpenChanges}
                         />
                       </ResizablePanel>
                       <ResizableHandle />
@@ -264,32 +270,14 @@ const RightSidebar: React.FC<RightSidebarProps> = ({
                   );
                 })()
               ) : task ? (
-                <ResizablePanelGroup
-                  direction="vertical"
-                  autoSaveId={RIGHT_SIDEBAR_VERTICAL_STORAGE_KEY}
-                >
-                  <ResizablePanel defaultSize={50} minSize={20}>
-                    <FileChangesPanel className="h-full min-h-0" />
-                  </ResizablePanel>
-                  <ResizableHandle />
-                  <ResizablePanel defaultSize={50} minSize={20}>
-                    <TaskTerminalPanel
-                      task={task}
-                      agent={task.agentId as Agent}
-                      projectPath={projectPath || task?.path}
-                      remote={
-                        projectRemoteConnectionId
-                          ? {
-                              connectionId: projectRemoteConnectionId,
-                              projectPath: projectRemotePath || projectPath || undefined,
-                            }
-                          : undefined
-                      }
-                      defaultBranch={projectDefaultBranch || undefined}
-                      className="h-full min-h-0"
-                    />
-                  </ResizablePanel>
-                </ResizablePanelGroup>
+                <SingleTaskSidebar
+                  task={task}
+                  projectPath={projectPath}
+                  projectRemoteConnectionId={projectRemoteConnectionId}
+                  projectRemotePath={projectRemotePath}
+                  projectDefaultBranch={projectDefaultBranch}
+                  onOpenChanges={onOpenChanges}
+                />
               ) : (
                 <ResizablePanelGroup
                   direction="vertical"
@@ -369,17 +357,58 @@ const RightSidebar: React.FC<RightSidebarProps> = ({
 
 export default RightSidebar;
 
-const VariantChangesIfAny: React.FC<{ path: string; taskId: string; className?: string }> = ({
-  path,
-  taskId,
-  className,
+const SingleTaskSidebar: React.FC<{
+  task: RightSidebarTask;
+  projectPath?: string | null;
+  projectRemoteConnectionId?: string | null;
+  projectRemotePath?: string | null;
+  projectDefaultBranch?: string | null;
+  onOpenChanges?: (filePath?: string, taskPath?: string) => void;
+}> = ({
+  task,
+  projectPath,
+  projectRemoteConnectionId,
+  projectRemotePath,
+  projectDefaultBranch,
+  onOpenChanges,
 }) => {
-  const { fileChanges } = useFileChanges(path);
+  return (
+    <ResizablePanelGroup direction="vertical" autoSaveId={RIGHT_SIDEBAR_VERTICAL_STORAGE_KEY}>
+      <ResizablePanel defaultSize={50} minSize={20}>
+        <FileChangesPanel className="h-full min-h-0" onOpenChanges={onOpenChanges} />
+      </ResizablePanel>
+      <ResizableHandle />
+      <ResizablePanel defaultSize={50} minSize={20}>
+        <TaskTerminalPanel
+          task={task}
+          agent={task.agentId as Agent}
+          projectPath={projectPath || task?.path}
+          remote={
+            projectRemoteConnectionId
+              ? {
+                  connectionId: projectRemoteConnectionId,
+                  projectPath: projectRemotePath || projectPath || undefined,
+                }
+              : undefined
+          }
+          defaultBranch={projectDefaultBranch || undefined}
+          className="h-full min-h-0"
+        />
+      </ResizablePanel>
+    </ResizablePanelGroup>
+  );
+};
+
+const VariantChangesIfAny: React.FC<{
+  path: string;
+  taskId: string;
+  className?: string;
+  onOpenChanges?: (filePath?: string, taskPath?: string) => void;
+}> = ({ path, taskId, className, onOpenChanges }) => {
   const { projectPath } = useTaskScope();
-  if (!fileChanges || fileChanges.length === 0) return null;
   return (
     <TaskScopeProvider value={{ taskId, taskPath: path, projectPath }}>
-      <FileChangesPanel className={className || 'min-h-0'} />
+      <FileChangesPanel className={className || 'min-h-0'} onOpenChanges={onOpenChanges} />
     </TaskScopeProvider>
   );
 };

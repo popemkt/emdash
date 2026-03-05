@@ -188,6 +188,11 @@ declare global {
         };
         error?: string;
       }>;
+      lifecycleGetLogs: (args: { taskId: string }) => Promise<{
+        success: boolean;
+        logs?: { setup: string[]; run: string[]; teardown: string[] };
+        error?: string;
+      }>;
       lifecycleClearTask: (args: {
         taskId: string;
       }) => Promise<{ success: boolean; error?: string }>;
@@ -339,8 +344,6 @@ declare global {
         error?: string;
       }>;
       githubLogout: () => Promise<void>;
-      getSettings: () => Promise<any>;
-      updateSettings: (settings: any) => Promise<void>;
       linearCheckConnection?: () => Promise<{
         connected: boolean;
         taskName?: string;
@@ -367,13 +370,6 @@ declare global {
         issues?: any[];
         error?: string;
       }>;
-      // Database methods
-      getProjects: () => Promise<any[]>;
-      saveProject: (project: any) => Promise<{ success: boolean; error?: string }>;
-      getTasks: (projectId?: string) => Promise<any[]>;
-      saveTask: (task: any) => Promise<{ success: boolean; error?: string }>;
-      deleteProject: (projectId: string) => Promise<{ success: boolean; error?: string }>;
-      deleteTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
     };
   }
 }

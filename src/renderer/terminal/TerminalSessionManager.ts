@@ -4,6 +4,8 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { ensureTerminalHost } from './terminalHost';
+import { TerminalInputBuffer } from './TerminalInputBuffer';
+import { classifyActivity } from '../lib/activityClassifier';
 import { TerminalMetrics } from './TerminalMetrics';
 import { log } from '../lib/logger';
 import { TERMINAL_SNAPSHOT_VERSION, type TerminalSnapshotPayload } from '#types/terminalSnapshot';
@@ -11,10 +13,13 @@ import { pendingInjectionManager } from '../lib/PendingInjectionManager';
 import { getProvider, type ProviderId } from '@shared/providers/registry';
 import {
   CTRL_J_ASCII,
+  CTRL_U_ASCII,
   shouldCopySelectionFromTerminal,
+  shouldKillLineFromTerminal,
   shouldMapShiftEnterToCtrlJ,
   shouldPasteToTerminal,
 } from './terminalKeybindings';
+import { rpc } from '@/lib/rpc';
 
 const SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MAX_DATA_WINDOW_BYTES = 128 * 1024 * 1024; // 128 MB soft guardrail
@@ -56,6 +61,7 @@ export interface TerminalSessionOptions {
   mapShiftEnterToCtrlJ?: boolean;
   disableSnapshots?: boolean;
   onLinkClick?: (url: string) => void;
+  onFirstMessage?: (message: string) => void;
 }
 
 type CleanupFn = () => void;
@@ -94,6 +100,9 @@ export class TerminalSessionManager {
   private lastSentResize: { cols: number; rows: number } | null = null;
   private isPanelResizeDragging = false;
   private hadFocusBeforeDetach = false;
+  private inputBuffer: TerminalInputBuffer | null = null;
+  private autoCopyOnSelection = false;
+  private selectionChangeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Timing for startup performance measurement
   private initStartTime: number = 0;
@@ -113,6 +122,16 @@ export class TerminalSessionManager {
     } as CSSStyleDeclaration);
     ensureTerminalHost().appendChild(this.container);
 
+    const openLink = (uri: string) => {
+      if (options.onLinkClick) {
+        options.onLinkClick(uri);
+      } else {
+        window.electronAPI.openExternal(uri).catch((error) => {
+          log.warn('Failed to open external link', { uri, error });
+        });
+      }
+    };
+
     this.terminal = new Terminal({
       cols: options.initialSize.cols,
       rows: options.initialSize.rows,
@@ -123,6 +142,9 @@ export class TerminalSessionManager {
       letterSpacing: 0,
       allowProposedApi: true,
       scrollOnUserInput: false,
+      linkHandler: {
+        activate: (_event, text) => openLink(text),
+      },
     });
 
     const updateCustomFont = (customFont?: string) => {
@@ -130,8 +152,9 @@ export class TerminalSessionManager {
       this.applyEffectiveFont();
     };
 
-    window.electronAPI.getSettings().then((result) => {
-      updateCustomFont(result?.settings?.terminal?.fontFamily);
+    rpc.appSettings.get().then((settings) => {
+      updateCustomFont(settings?.terminal?.fontFamily);
+      this.autoCopyOnSelection = settings?.terminal?.autoCopyOnSelection ?? false;
     });
 
     const handleFontChange = (e: Event) => {
@@ -142,6 +165,15 @@ export class TerminalSessionManager {
     window.addEventListener('terminal-font-changed', handleFontChange);
     this.disposables.push(() =>
       window.removeEventListener('terminal-font-changed', handleFontChange)
+    );
+
+    const handleAutoCopyChange = (e: Event) => {
+      const detail = (e as CustomEvent<{ autoCopyOnSelection?: boolean }>).detail;
+      this.autoCopyOnSelection = detail?.autoCopyOnSelection ?? false;
+    };
+    window.addEventListener('terminal-auto-copy-changed', handleAutoCopyChange);
+    this.disposables.push(() =>
+      window.removeEventListener('terminal-auto-copy-changed', handleAutoCopyChange)
     );
 
     const handlePanelResizeDragging = (e: Event) => {
@@ -172,18 +204,8 @@ export class TerminalSessionManager {
 
     // Initialize WebLinks addon with custom handler
     this.webLinksAddon = new WebLinksAddon((event, uri) => {
-      // Prevent default behavior
       event.preventDefault();
-
-      // Call the custom link handler if provided, otherwise use default behavior
-      if (options.onLinkClick) {
-        options.onLinkClick(uri);
-      } else {
-        // Fallback to opening directly via electronAPI
-        window.electronAPI.openExternal(uri).catch((error) => {
-          log.warn('Failed to open external link', { uri, error });
-        });
-      }
+      openLink(uri);
     });
 
     this.terminal.loadAddon(this.fitAddon);
@@ -282,6 +304,14 @@ export class TerminalSessionManager {
         return false; // Prevent xterm from processing the Shift+Enter
       }
 
+      if (shouldKillLineFromTerminal(event, IS_MAC_PLATFORM)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+        this.handleTerminalInput(CTRL_U_ASCII, true);
+        return false;
+      }
+
       // Map Cmd+Left/Right to Ctrl+A/E on macOS (line navigation)
       if (IS_MAC_PLATFORM && event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
         if (event.key === 'ArrowLeft') {
@@ -307,6 +337,14 @@ export class TerminalSessionManager {
       maxDataWindowBytes: MAX_DATA_WINDOW_BYTES,
       telemetry: options.telemetry ?? null,
     });
+
+    // Set up one-shot capture of the user's first terminal message
+    if (options.onFirstMessage) {
+      const callback = options.onFirstMessage;
+      this.inputBuffer = new TerminalInputBuffer((message) => {
+        callback(message);
+      });
+    }
 
     const inputDisposable = this.terminal.onData((data) => {
       this.handleTerminalInput(data);
@@ -341,6 +379,30 @@ export class TerminalSessionManager {
         element.style.width = '100%';
         element.style.height = '100%';
       }
+
+      const selectionDisposable = this.terminal.onSelectionChange(() => {
+        if (!this.autoCopyOnSelection || this.disposed) return;
+        if (!this.terminal.hasSelection()) return;
+        if (this.selectionChangeDebounceTimer) {
+          clearTimeout(this.selectionChangeDebounceTimer);
+        }
+        this.selectionChangeDebounceTimer = setTimeout(() => {
+          try {
+            if (!this.disposed && this.terminal.hasSelection()) {
+              this.copySelectionToClipboard();
+            }
+          } catch (error) {
+            log.warn('Auto-copy on selection failed', { id: this.id, error });
+          }
+        }, 150);
+      });
+      this.disposables.push(() => {
+        if (this.selectionChangeDebounceTimer) {
+          clearTimeout(this.selectionChangeDebounceTimer);
+          this.selectionChangeDebounceTimer = null;
+        }
+        selectionDisposable.dispose();
+      });
     }
 
     this.scheduleFit();
@@ -427,6 +489,7 @@ export class TerminalSessionManager {
         });
       }
     }
+    this.inputBuffer = null;
     this.metrics.dispose();
     this.activityListeners.clear();
     this.readyListeners.clear();
@@ -501,6 +564,11 @@ export class TerminalSessionManager {
     }
 
     if (!filtered) return;
+
+    // Feed input to the buffer for first-message capture
+    if (this.inputBuffer && !this.inputBuffer.isComplete) {
+      this.inputBuffer.feed(filtered);
+    }
 
     // Track command execution when Enter is pressed (but not for newline inserts)
     const isEnterPress = filtered.includes('\r') || filtered.includes('\n');
@@ -845,9 +913,17 @@ export class TerminalSessionManager {
     // Connect to PTY - pass resume flag if we have a previous session
     const result = await this.connectPty(hasSnapshot);
 
+    // When tmux is active, disable snapshots — tmux preserves terminal state natively.
+    if (result?.tmux) {
+      this.options.disableSnapshots = true;
+      this.stopSnapshotTimer();
+    }
+
     // Decide whether to restore snapshot based on PTY result
     try {
-      if (result?.reused) {
+      if (result?.tmux) {
+        // Tmux session: skip snapshot — tmux restores its own scrollback on reattach
+      } else if (result?.reused) {
         // Hot reload - PTY still running, restore snapshot for visual continuity
         if (snapshot) {
           this.applySnapshot(snapshot);
@@ -899,7 +975,7 @@ export class TerminalSessionManager {
 
   private async connectPty(
     hasExistingSession: boolean = false
-  ): Promise<{ ok: boolean; reused?: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; reused?: boolean; tmux?: boolean; error?: string }> {
     this.ptyConnectStartTime = performance.now();
     const { taskId, cwd, providerId, shell, env, initialSize, autoApprove, initialPrompt } =
       this.options;
@@ -987,6 +1063,14 @@ export class TerminalSessionManager {
       }
       const buffer = this.terminal.buffer?.active;
       const isAtBottom = buffer ? buffer.baseY - buffer.viewportY <= 2 : true;
+
+      // Check if agent started processing — confirms the user's input was accepted
+      if (this.inputBuffer && !this.inputBuffer.isComplete) {
+        const signal = classifyActivity(this.options.providerId ?? null, chunk);
+        if (signal === 'busy') {
+          this.inputBuffer.confirmSubmit();
+        }
+      }
 
       try {
         this.terminal.write(chunk);
