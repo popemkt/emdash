@@ -273,3 +273,40 @@ describe('stale Claude session detection', () => {
     expect(fsWriteFileSyncMock).toHaveBeenCalledWith(SESSION_MAP_PATH, JSON.stringify({}));
   });
 });
+
+describe('ptyManager shell defaults', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  it('defaults to PowerShell on Windows instead of ComSpec', async () => {
+    const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    const originalComSpec = process.env.ComSpec;
+    const originalSystemRoot = process.env.SystemRoot;
+
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+      configurable: true,
+    });
+    process.env.ComSpec = 'C:\\Windows\\System32\\cmd.exe';
+    process.env.SystemRoot = 'C:\\Windows';
+
+    try {
+      const { getDefaultShell } = await import('../../main/services/ptyManager');
+
+      expect(getDefaultShell()).toBe(
+        'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+      );
+    } finally {
+      if (originalComSpec === undefined) delete process.env.ComSpec;
+      else process.env.ComSpec = originalComSpec;
+
+      if (originalSystemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = originalSystemRoot;
+
+      if (originalPlatformDescriptor) {
+        Object.defineProperty(process, 'platform', originalPlatformDescriptor);
+      }
+    }
+  });
+});

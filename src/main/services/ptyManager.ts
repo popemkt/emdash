@@ -987,10 +987,11 @@ export function startDirectPty(options: {
   return proc;
 }
 
-function getDefaultShell(): string {
+export function getDefaultShell(): string {
   if (process.platform === 'win32') {
-    // Prefer ComSpec (usually cmd.exe) or fallback to PowerShell
-    return process.env.ComSpec || 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+    // Default to PowerShell on Windows rather than ComSpec/cmd.exe.
+    return path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   }
   return process.env.SHELL || '/bin/bash';
 }
