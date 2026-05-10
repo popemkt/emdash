@@ -9,11 +9,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { HttpClient } from './http-client';
-import { IdentityError, loadIdentity } from './identity';
+import { IdentityError, loadIdentity, type Identity } from './identity';
 import { registerAllTools } from './tools';
 
 async function main(): Promise<void> {
-  let identity;
+  let identity: Identity;
   try {
     identity = loadIdentity();
   } catch (err) {

@@ -17,7 +17,10 @@ export class HttpClient {
     };
   }
 
-  async get<T>(path: string, query?: Record<string, string | number | boolean>): Promise<T> {
+  async get<T = unknown>(
+    path: string,
+    query?: Record<string, string | number | boolean>
+  ): Promise<T> {
     const url = new URL(path, this.identity.statusUrl);
     for (const [k, v] of Object.entries(query ?? {})) {
       url.searchParams.set(k, String(v));
@@ -27,7 +30,7 @@ export class HttpClient {
     return (await res.json()) as T;
   }
 
-  async post<T>(path: string, body?: unknown): Promise<T> {
+  async post<T = unknown>(path: string, body?: unknown): Promise<T> {
     const url = new URL(path, this.identity.statusUrl);
     const res = await fetch(url, {
       method: 'POST',
@@ -38,7 +41,7 @@ export class HttpClient {
     return (await res.json()) as T;
   }
 
-  async delete<T>(path: string): Promise<T> {
+  async delete<T = unknown>(path: string): Promise<T> {
     const url = new URL(path, this.identity.statusUrl);
     const res = await fetch(url, { method: 'DELETE', headers: this.headers() });
     if (!res.ok) throw new Error(`emdash-mcp: DELETE ${path} failed (${res.status})`);
