@@ -245,6 +245,9 @@ pnpm run lint
 ## Agent Guardrails
 
 - Load only the relevant `agents/` docs for the area being changed.
+- Treat `origin` as the user's personal fork and `upstream` as fetch-only. Do not push to
+  `upstream`, open PRs against `upstream`, sync the fork back upstream, or merge upstream PRs
+  unless the user explicitly asks for that specific action.
 - Do not hand-edit numbered Drizzle migrations or `drizzle/meta/`.
 - Use `pnpm run db:generate` for new migrations, then update fixtures and migration tests.
 - Avoid editing `dist/`, `release/`, `out/`, `build/`, and generated package artifacts
