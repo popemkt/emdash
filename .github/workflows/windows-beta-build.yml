@@ -48,7 +48,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Setup Python 3.11 for node-gyp
@@ -78,14 +78,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ELECTRON_VERSION=$(node -p "require('electron/package.json').version")
-          npm_config_build_from_source=true pnpm exec electron-rebuild -f -a x64 -v "$ELECTRON_VERSION" -o sqlite3,node-pty
+          node --experimental-strip-types scripts/release/rebuild-native.ts --arch x64
 
       - name: Package Windows (NSIS + MSI) (no publish)
         shell: bash
         run: |
           set -euo pipefail
-          pnpm exec electron-builder --win nsis msi --x64 --publish never --config.npmRebuild=false
+          pnpm exec electron-builder --win nsis msi --x64 --publish never \
+            --config electron-builder.config.ts \
+            --config.npmRebuild=false
           ls -lah release || true
 
       - name: Upload Windows artifacts
