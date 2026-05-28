@@ -15,6 +15,7 @@ import { localDependencyManager } from './core/dependencies/dependency-manager';
 import { editorBufferService } from './core/editor/editor-buffer-service';
 import { gitWatcherRegistry } from './core/git/git-watcher-registry';
 import { githubConnectionService } from './core/github/services/github-connection-service';
+import { mcpInternalService } from './core/mcp-internal';
 import { projectManager } from './core/projects/project-manager';
 import { projectSettingsService } from './core/projects/settings/project-settings-service';
 import { promptLibraryService } from './core/prompt-library/service';
@@ -29,6 +30,11 @@ import { appSettingsService } from './core/settings/settings-service';
 import { updateService } from './core/updates/update-service';
 import { viewStateService } from './core/view-state/view-state-service';
 import { initializeDatabase } from './db/initialize';
+import {
+  initializeFileLogger,
+  registerProcessErrorLogging,
+  registerRendererLogHandler,
+} from './lib/file-logger';
 import { log } from './lib/logger';
 import { telemetryService } from './lib/telemetry';
 import { rpcRouter } from './rpc';
@@ -46,6 +52,9 @@ registerAppScheme();
 
 app.setName(PRODUCT_NAME);
 app.setPath('userData', join(app.getPath('appData'), 'emdash'));
+initializeFileLogger();
+registerProcessErrorLogging(log);
+registerRendererLogHandler(ipcMain);
 
 app.on('second-instance', () => {
   const win = BrowserWindow.getAllWindows()[0];
@@ -124,6 +133,9 @@ void app.whenReady().then(async () => {
   agentHookService.initialize().catch((e) => {
     log.error('Failed to start agent event service:', e);
   });
+  mcpInternalService.initialize().catch((e) => {
+    log.error('Failed to start internal MCP service:', e);
+  });
 
   emdashAccountService.loadSessionToken().catch((e) => {
     log.warn('Failed to load account session token:', e);
@@ -166,6 +178,7 @@ app.on('before-quit', (event) => {
     void projectManager.dispose().catch((e) => {
       log.error('Failed to shutdown project manager:', e);
     });
+    mcpInternalService.dispose();
     app.exit(0);
   });
 });
