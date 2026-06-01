@@ -74,8 +74,8 @@ export const RenameConversationModal = observer(function RenameConversationModal
               maxLength={128}
               autoFocus
             />
-            {isEmpty && <p className="mt-1 text-xs text-destructive">Name cannot be empty.</p>}
-            {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+            {isEmpty && <p className="text-destructive mt-1 text-xs">Name cannot be empty.</p>}
+            {error && <p className="text-destructive mt-1 text-xs">{error}</p>}
           </Field>
         </FieldGroup>
       </DialogContentArea>

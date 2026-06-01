@@ -11,7 +11,7 @@ export const ArchivedProjectsSection = observer(function ArchivedProjectsSection
   const expanded = sidebarStore.isArchivedExpanded;
 
   return (
-    <div className="border-t border-border/50 px-3 pt-1 pb-2 shrink-0">
+    <div className="shrink-0 border-t border-border/50 px-3 pt-1 pb-2">
       <button
         type="button"
         onClick={() => sidebarStore.toggleArchivedExpanded()}
