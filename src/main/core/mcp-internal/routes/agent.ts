@@ -3,8 +3,15 @@ import { eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 import { createConversation } from '@main/core/conversations/createConversation';
 import { getConversationById } from '@main/core/conversations/getConversationById';
+import {
+  getTranscriptReader,
+  isTranscriptSupported,
+} from '@main/core/conversations/provider-session/manifest';
+import type { TranscriptItem } from '@main/core/conversations/provider-session/types';
 import { mapConversationRowToConversation } from '@main/core/conversations/utils';
 import { ptySessionRegistry } from '@main/core/pty/pty-session-registry';
+import { taskManager } from '@main/core/tasks/task-manager';
+import { workspaceRegistry } from '@main/core/workspaces/workspace-registry';
 import { db } from '@main/db/client';
 import { conversations, projects, tasks } from '@main/db/schema';
 import {
@@ -13,16 +20,26 @@ import {
   type AgentProviderId,
 } from '@shared/agent-provider-registry';
 import type { Conversation } from '@shared/conversations';
+import type { AgentEvent } from '@shared/events/agentEvents';
 import { makePtySessionId } from '@shared/ptySessionId';
+import type { AgentEventBuffer } from '../event-buffer';
 import { HttpError, type CallerContext } from '../http-server';
+
+const DEFAULT_LONG_POLL_MS = 15_000;
+export const MAX_LONG_POLL_MS = 60_000;
+export const MIN_LONG_POLL_MS = 1_000;
 
 export const ScopeSchema = z.enum(['task', 'project', 'all']);
 export type Scope = z.infer<typeof ScopeSchema>;
+
+export const FetchKindSchema = z.enum(['events', 'scrollback', 'transcript']);
+export type FetchKind = z.infer<typeof FetchKindSchema>;
 
 export const SpawnBodySchema = z.object({
   providerId: z.string(),
   name: z.string().optional(),
   initialPrompt: z.string().optional(),
+  sameTask: z.literal(true).optional(),
 });
 export type SpawnBody = z.infer<typeof SpawnBodySchema>;
 
@@ -38,6 +55,30 @@ export const InterruptBodySchema = z.object({
 });
 export type InterruptBody = z.infer<typeof InterruptBodySchema>;
 
+export const ObserveQuerySchema = z.object({
+  waitForChange: z.boolean().optional(),
+  timeoutMs: z.number().int().min(MIN_LONG_POLL_MS).max(MAX_LONG_POLL_MS).optional(),
+});
+export type ObserveQuery = z.infer<typeof ObserveQuerySchema>;
+
+export const FetchQuerySchema = z.object({
+  kind: FetchKindSchema.optional(),
+  limit: z.number().int().positive().optional(),
+  since: z.string().min(1).optional(),
+});
+export type FetchQuery = z.infer<typeof FetchQuerySchema>;
+
+export type AgentStatus = 'unknown' | 'working' | 'awaiting-input' | 'error' | 'idle';
+export type ProviderTier = 'hooks' | 'classifier' | 'unsupported';
+export type EventCursor = string & { readonly __brand: 'EventCursor' };
+
+const encodeCursor = (timestampMs: number): EventCursor => String(timestampMs) as EventCursor;
+const decodeCursor = (cursor: string | undefined): number | undefined => {
+  if (cursor === undefined) return undefined;
+  const value = Number(cursor);
+  return Number.isFinite(value) ? value : undefined;
+};
+
 interface SelfResponse {
   conversationId: string;
   taskId: string;
@@ -51,7 +92,40 @@ interface SelfResponse {
 interface PeerSummary extends SelfResponse {
   lastActivityAt: string | null;
   running: boolean;
+  status: AgentStatus;
 }
+
+interface ObserveResponse {
+  status: AgentStatus;
+  recentEvents: AgentEvent[];
+  lastAssistantMessage?: string;
+  providerTier: ProviderTier;
+  statusChangedAt: number | null;
+}
+
+export type FetchResponse =
+  | {
+      kind: 'events';
+      events: AgentEvent[];
+      nextCursor?: EventCursor;
+      providerTier: ProviderTier;
+      transcriptSupported: boolean;
+    }
+  | {
+      kind: 'scrollback';
+      scrollback: string;
+      providerTier: ProviderTier;
+      transcriptSupported: boolean;
+    }
+  | {
+      kind: 'transcript';
+      items: TranscriptItem[];
+      nextCursor?: string;
+      providerTier: ProviderTier;
+      transcriptSupported: boolean;
+    };
+
+const TERMINAL_STATUSES: ReadonlySet<AgentStatus> = new Set(['idle', 'error', 'awaiting-input']);
 
 async function lookupNames(
   taskIds: string[],
@@ -76,6 +150,31 @@ async function lookupNames(
 
 function getSessionId(conversation: Conversation): string {
   return makePtySessionId(conversation.projectId, conversation.taskId, conversation.id);
+}
+
+function deriveStatus(events: AgentEvent[]): AgentStatus {
+  if (events.length === 0) return 'unknown';
+  const last = events[events.length - 1];
+  if (last.type === 'error') return 'error';
+  if (last.type === 'stop') return 'idle';
+  if (last.type === 'notification') {
+    const notificationType = last.payload.notificationType;
+    if (
+      notificationType === 'permission_prompt' ||
+      notificationType === 'idle_prompt' ||
+      notificationType === 'elicitation_dialog'
+    ) {
+      return 'awaiting-input';
+    }
+    return 'working';
+  }
+  return 'working';
+}
+
+function deriveProviderTier(providerId: string): ProviderTier {
+  const provider = getProvider(providerId as AgentProviderId);
+  if (!provider) return 'unsupported';
+  return provider.supportsHooks ? 'hooks' : 'classifier';
 }
 
 function assertCrossTaskWrite(
@@ -129,7 +228,8 @@ export async function handleAgentSelf(caller: CallerContext): Promise<SelfRespon
 
 export async function handleAgentListPeers(
   caller: CallerContext,
-  scope: Scope
+  scope: Scope,
+  buffer: AgentEventBuffer
 ): Promise<PeerSummary[]> {
   const rows = await selectPeerRows(caller, scope);
   const filtered = rows.filter((row) => row.id !== caller.conversation.id);
@@ -150,8 +250,40 @@ export async function handleAgentListPeers(
       name: conversation.title,
       lastActivityAt: conversation.lastInteractedAt,
       running: Boolean(ptySessionRegistry.get(getSessionId(conversation))),
+      status: deriveStatus(buffer.getState(conversation.id)?.recent ?? []),
     };
   });
+}
+
+export async function handleAgentObserve(
+  _caller: CallerContext,
+  targetConversationId: string,
+  query: ObserveQuery,
+  buffer: AgentEventBuffer
+): Promise<ObserveResponse> {
+  const target = await loadTargetConversation(targetConversationId);
+
+  if (query.waitForChange) {
+    const state = buffer.getState(targetConversationId);
+    const currentStatus = deriveStatus(state?.recent ?? []);
+    if (!TERMINAL_STATUSES.has(currentStatus)) {
+      const timeoutMs = Math.min(
+        Math.max(query.timeoutMs ?? DEFAULT_LONG_POLL_MS, MIN_LONG_POLL_MS),
+        MAX_LONG_POLL_MS
+      );
+      await buffer.waitForChange(targetConversationId, state?.lastAt ?? 0, timeoutMs);
+    }
+  }
+
+  const state = buffer.getState(targetConversationId);
+  const recentEvents = state?.recent ?? [];
+  return {
+    status: deriveStatus(recentEvents),
+    recentEvents,
+    lastAssistantMessage: state?.lastAssistantMessage,
+    providerTier: deriveProviderTier(target.providerId),
+    statusChangedAt: state?.lastAt ?? null,
+  };
 }
 
 export async function handleAgentSpawn(
@@ -204,4 +336,69 @@ export async function handleAgentInterrupt(
 
   pty.write('\x03');
   return { ok: true };
+}
+
+export async function handleAgentFetch(
+  _caller: CallerContext,
+  targetConversationId: string,
+  query: FetchQuery,
+  buffer: AgentEventBuffer
+): Promise<FetchResponse> {
+  const target = await loadTargetConversation(targetConversationId);
+  const kind: FetchKind = query.kind ?? 'events';
+  const providerTier = deriveProviderTier(target.providerId);
+  const transcriptSupported = isTranscriptSupported(target.providerId);
+
+  if (kind === 'events') {
+    const all = buffer.getEvents(target.id, decodeCursor(query.since));
+    const events = query.limit ? all.slice(-query.limit) : all;
+    const last = events[events.length - 1];
+    return {
+      kind: 'events',
+      events,
+      nextCursor: last ? encodeCursor(last.timestamp) : undefined,
+      providerTier,
+      transcriptSupported,
+    };
+  }
+
+  if (kind === 'scrollback') {
+    const scrollback = ptySessionRegistry.peekRingBuffer(getSessionId(target));
+    return {
+      kind: 'scrollback',
+      scrollback:
+        query.limit && scrollback.length > query.limit
+          ? scrollback.slice(-query.limit)
+          : scrollback,
+      providerTier,
+      transcriptSupported,
+    };
+  }
+
+  const reader = getTranscriptReader(target.providerId);
+  if (!reader || !target.providerSessionId) {
+    return {
+      kind: 'transcript',
+      items: [],
+      providerTier,
+      transcriptSupported: Boolean(reader),
+    };
+  }
+
+  const workspaceId = taskManager.getWorkspaceId(target.taskId);
+  const taskPath = workspaceId ? workspaceRegistry.get(workspaceId)?.path : undefined;
+  const result = await reader.fetch({
+    providerSessionId: target.providerSessionId,
+    taskPath,
+    ...(query.limit ? { limit: query.limit } : {}),
+    ...(query.since ? { since: query.since } : {}),
+  });
+
+  return {
+    kind: 'transcript',
+    items: result.items,
+    nextCursor: result.nextCursor,
+    providerTier,
+    transcriptSupported,
+  };
 }

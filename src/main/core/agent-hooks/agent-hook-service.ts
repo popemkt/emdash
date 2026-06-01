@@ -5,6 +5,7 @@ import type { IDisposable, IInitializable } from '@main/lib/lifecycle';
 import { telemetryService } from '@main/lib/telemetry';
 import { agentEventChannel, type AgentEvent } from '@shared/events/agentEvents';
 import { conversationChangedChannel } from '@shared/events/conversationEvents';
+import { agentEventBus } from './agent-event-bus';
 import { handleCodexSessionStartHook } from './codex-session-start';
 import { enrichEvent } from './event-enricher';
 import { handleProviderSessionHook } from './handle-provider-session-hook';
@@ -30,7 +31,9 @@ class AgentHookService implements IInitializable, IDisposable {
       event.source = 'hook';
       const appFocused = isAppFocused();
       await maybeShowNotification(event, appFocused);
-      events.emit(agentEventChannel, { event, appFocused });
+      const envelope = { event, appFocused };
+      agentEventBus.emitEnvelope(envelope);
+      events.emit(agentEventChannel, envelope);
     });
 
     conversationEvents.on(
@@ -46,7 +49,9 @@ class AgentHookService implements IInitializable, IDisposable {
           timestamp: Date.now(),
           payload: {},
         };
-        events.emit(agentEventChannel, { event: agentEvent, appFocused: isAppFocused() });
+        const envelope = { event: agentEvent, appFocused: isAppFocused() };
+        agentEventBus.emitEnvelope(envelope);
+        events.emit(agentEventChannel, envelope);
 
         telemetryService.capture('agent_run_started', {
           provider: providerId,

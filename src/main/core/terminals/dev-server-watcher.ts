@@ -3,6 +3,7 @@ import { stripAnsi } from '@main/core/agent-hooks/classifiers/base';
 import { events } from '@main/lib/events';
 import { hostPreviewEventChannel } from '@shared/events/hostPreviewEvents';
 import type { Pty } from '../pty/pty';
+import { hostPreviewBus } from './host-preview-bus';
 
 const PROBE_INTERVAL_MS = 1000;
 const PROBE_TIMEOUT_MS = 500;
@@ -101,7 +102,9 @@ export function wireTerminalDevServerWatcher({
     stopProbe = null;
     if (found) {
       found = false;
-      events.emit(hostPreviewEventChannel, { type: 'exit', taskId: scopeId, terminalId });
+      const event = { type: 'exit' as const, taskId: scopeId, terminalId };
+      hostPreviewBus.emitEvent(event);
+      events.emit(hostPreviewEventChannel, event);
     }
   };
 
@@ -121,7 +124,9 @@ export function wireTerminalDevServerWatcher({
 
     found = true;
     const url = normalizeUrl(match[0]);
-    events.emit(hostPreviewEventChannel, { type: 'url', taskId: scopeId, terminalId, url });
+    const event = { type: 'url' as const, taskId: scopeId, terminalId, url };
+    hostPreviewBus.emitEvent(event);
+    events.emit(hostPreviewEventChannel, event);
 
     if (probe) {
       stopProbe = startProbe(url, cleanup);

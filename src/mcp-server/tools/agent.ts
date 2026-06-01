@@ -42,6 +42,42 @@ export function registerAgentTools(server: McpServer, http: HttpClient): void {
   );
 
   server.tool(
+    'agent_observe',
+    "Return a peer agent's current status, recent events, and last assistant message when available. waitForChange long-polls until the peer changes state or times out.",
+    {
+      conversationId: z.string(),
+      waitForChange: z.boolean().optional(),
+      timeoutMs: z.number().int().min(1000).max(60000).optional(),
+    },
+    async ({ conversationId, waitForChange, timeoutMs }) =>
+      asText(
+        await http.get(`/agent/${encodeURIComponent(conversationId)}/observe`, {
+          ...(waitForChange ? { waitForChange: true } : {}),
+          ...(timeoutMs ? { timeoutMs } : {}),
+        })
+      )
+  );
+
+  server.tool(
+    'agent_fetch',
+    "Fetch peer agent data. kind='events' returns structured recent agent events, kind='scrollback' returns raw PTY ring buffer text, and kind='transcript' returns provider transcript items when the provider exposes a session id.",
+    {
+      conversationId: z.string(),
+      kind: z.enum(['events', 'scrollback', 'transcript']).optional(),
+      limit: z.number().int().positive().optional(),
+      since: z.string().optional(),
+    },
+    async ({ conversationId, kind, limit, since }) =>
+      asText(
+        await http.get(`/agent/${encodeURIComponent(conversationId)}/fetch`, {
+          ...(kind ? { kind } : {}),
+          ...(limit ? { limit } : {}),
+          ...(since ? { since } : {}),
+        })
+      )
+  );
+
+  server.tool(
     'agent_send',
     "Send text to a peer agent's PTY. submit=true, the default, presses Enter after typing. submit=false stages a draft in the target UI.",
     {

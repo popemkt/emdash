@@ -3,18 +3,38 @@ import { ZodError, type ZodType } from 'zod';
 import { getConversationById } from '@main/core/conversations/getConversationById';
 import { log } from '@main/lib/logger';
 import type { Conversation } from '@shared/conversations';
+import { DevServerTracker } from './dev-server-tracker';
+import { AgentEventBuffer } from './event-buffer';
 import type { McpInternalInstance } from './instance';
 import {
+  FetchQuerySchema,
+  handleAgentFetch,
   handleAgentInterrupt,
   handleAgentListPeers,
+  handleAgentObserve,
   handleAgentSelf,
   handleAgentSend,
   handleAgentSpawn,
   InterruptBodySchema,
+  ObserveQuerySchema,
   ScopeSchema,
   SendBodySchema,
   SpawnBodySchema,
 } from './routes/agent';
+import {
+  handleProjectList,
+  handleTaskCreate,
+  handleTaskList,
+  handleTerminalCreate,
+  handleTerminalList,
+  handleTerminalSend,
+  handleWorkspaceDevServers,
+  ProjectListQuerySchema,
+  TaskCreateBodySchema,
+  TaskListQuerySchema,
+  TerminalCreateBodySchema,
+  TerminalSendBodySchema,
+} from './routes/orchestration';
 
 export class HttpError extends Error {
   constructor(
@@ -35,6 +55,9 @@ const HEADER_SESSION = 'x-emdash-session-id';
 const MAX_BODY_BYTES = 1_000_000;
 const AGENT_SEND_RE = /^\/agent\/([^/]+)\/send$/;
 const AGENT_INTERRUPT_RE = /^\/agent\/([^/]+)\/interrupt$/;
+const AGENT_OBSERVE_RE = /^\/agent\/([^/]+)\/observe$/;
+const AGENT_FETCH_RE = /^\/agent\/([^/]+)\/fetch$/;
+const TERMINAL_SEND_RE = /^\/terminals\/([^/]+)\/send$/;
 
 function parseOrThrow<T>(schema: ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
@@ -48,11 +71,16 @@ function parseOrThrow<T>(schema: ZodType<T>, value: unknown): T {
 export class McpInternalHttpServer {
   private server: http.Server | null = null;
   private port = 0;
+  private readonly eventBuffer = new AgentEventBuffer();
+  private readonly devServerTracker = new DevServerTracker();
 
   constructor(private readonly instance: McpInternalInstance) {}
 
   async start(): Promise<{ port: number }> {
     if (this.server) return { port: this.port };
+
+    this.eventBuffer.start();
+    this.devServerTracker.start();
 
     this.server = http.createServer((req, res) => {
       void this.handle(req, res).catch((error) => {
@@ -79,6 +107,8 @@ export class McpInternalHttpServer {
     this.server?.close();
     this.server = null;
     this.port = 0;
+    this.eventBuffer.stop();
+    this.devServerTracker.stop();
   }
 
   getPort(): number {
@@ -103,7 +133,7 @@ export class McpInternalHttpServer {
 
       if (method === 'GET' && path === '/agent/peers') {
         const scope = parseOrThrow(ScopeSchema, params.get('scope') ?? 'task');
-        return this.send(res, 200, await handleAgentListPeers(caller, scope));
+        return this.send(res, 200, await handleAgentListPeers(caller, scope, this.eventBuffer));
       }
 
       if (method === 'POST' && path === '/agent/spawn') {
@@ -121,6 +151,38 @@ export class McpInternalHttpServer {
         );
       }
 
+      const observeMatch = path.match(AGENT_OBSERVE_RE);
+      if (observeMatch && method === 'GET') {
+        const query = parseOrThrow(ObserveQuerySchema, {
+          waitForChange: params.get('waitForChange') === 'true' ? true : undefined,
+          timeoutMs: params.get('timeoutMs') ? Number(params.get('timeoutMs')) : undefined,
+        });
+        return this.send(
+          res,
+          200,
+          await handleAgentObserve(
+            caller,
+            decodeURIComponent(observeMatch[1]),
+            query,
+            this.eventBuffer
+          )
+        );
+      }
+
+      const fetchMatch = path.match(AGENT_FETCH_RE);
+      if (fetchMatch && method === 'GET') {
+        const query = parseOrThrow(FetchQuerySchema, {
+          kind: params.get('kind') ?? undefined,
+          limit: params.get('limit') ? Number(params.get('limit')) : undefined,
+          since: params.get('since') ?? undefined,
+        });
+        return this.send(
+          res,
+          200,
+          await handleAgentFetch(caller, decodeURIComponent(fetchMatch[1]), query, this.eventBuffer)
+        );
+      }
+
       const interruptMatch = path.match(AGENT_INTERRUPT_RE);
       if (interruptMatch && method === 'POST') {
         const body = parseOrThrow(InterruptBodySchema, await this.readJson(req));
@@ -128,6 +190,49 @@ export class McpInternalHttpServer {
           res,
           200,
           await handleAgentInterrupt(caller, decodeURIComponent(interruptMatch[1]), body)
+        );
+      }
+
+      if (method === 'GET' && path === '/projects') {
+        const query = parseOrThrow(ProjectListQuerySchema, {
+          includeArchived: params.get('includeArchived') === 'true' ? true : undefined,
+        });
+        return this.send(res, 200, await handleProjectList(caller, query));
+      }
+
+      if (method === 'GET' && path === '/tasks') {
+        const query = parseOrThrow(TaskListQuerySchema, {
+          projectId: params.get('projectId') ?? undefined,
+          includeArchived: params.get('includeArchived') === 'true' ? true : undefined,
+        });
+        return this.send(res, 200, await handleTaskList(caller, query));
+      }
+
+      if (method === 'POST' && path === '/tasks') {
+        const body = parseOrThrow(TaskCreateBodySchema, await this.readJson(req));
+        return this.send(res, 200, await handleTaskCreate(caller, body));
+      }
+
+      if (method === 'GET' && path === '/workspace/dev-servers') {
+        return this.send(res, 200, handleWorkspaceDevServers(caller, this.devServerTracker));
+      }
+
+      if (method === 'GET' && path === '/terminals') {
+        return this.send(res, 200, await handleTerminalList(caller));
+      }
+
+      if (method === 'POST' && path === '/terminals') {
+        const body = parseOrThrow(TerminalCreateBodySchema, await this.readJson(req));
+        return this.send(res, 200, await handleTerminalCreate(caller, body));
+      }
+
+      const terminalSendMatch = path.match(TERMINAL_SEND_RE);
+      if (terminalSendMatch && method === 'POST') {
+        const body = parseOrThrow(TerminalSendBodySchema, await this.readJson(req));
+        return this.send(
+          res,
+          200,
+          await handleTerminalSend(caller, decodeURIComponent(terminalSendMatch[1]), body)
         );
       }
 

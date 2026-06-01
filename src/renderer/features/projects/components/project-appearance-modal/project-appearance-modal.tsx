@@ -91,7 +91,7 @@ export const ProjectAppearanceModal = observer(function ProjectAppearanceModal({
       <DialogHeader showCloseButton={false}>
         <DialogTitle>Customize project</DialogTitle>
       </DialogHeader>
-      <DialogContentArea className="pt-0 max-h-[70vh] overflow-y-auto">
+      <DialogContentArea className="max-h-[70vh] overflow-y-auto pt-0">
         <Tabs.Root defaultValue={initialTab} className="flex flex-col gap-4">
           <Tabs.List className="flex gap-1 rounded-md bg-background-secondary p-1">
             <Tabs.Trigger
@@ -117,7 +117,7 @@ export const ProjectAppearanceModal = observer(function ProjectAppearanceModal({
 
           <Tabs.Content value="icons" className="flex flex-col gap-3">
             <div className="relative">
-              <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-foreground-muted" />
+              <Search className="pointer-events-none absolute top-1/2 left-2 size-4 -translate-y-1/2 text-foreground-muted" />
               <Input
                 value={iconSearch}
                 onChange={(e) => setIconSearch(e.target.value)}
@@ -197,7 +197,7 @@ export const ProjectAppearanceModal = observer(function ProjectAppearanceModal({
           </div>
         </section>
 
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && <p className="text-destructive mt-2 text-xs">{error}</p>}
       </DialogContentArea>
       <DialogFooter>
         <Button variant="outline" onClick={handleReset} disabled={isSubmitting}>
