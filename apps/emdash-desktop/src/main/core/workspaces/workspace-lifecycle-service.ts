@@ -129,12 +129,38 @@ export class LifecycleScriptService implements IDisposable {
     });
   }
 
+  async spawnLifecycleScriptCommand(
+    script: LifecycleScript,
+    options: { initialSize?: { cols: number; rows: number } } = {}
+  ): Promise<void> {
+    const { initialSize = { cols: DEFAULT_COLS, rows: DEFAULT_ROWS } } = options;
+    const { terminalId, sessionId } = this.resolveIds(script);
+    if (ptySessionRegistry.get(sessionId)) return;
+
+    await this.terminals.spawnLifecycleScript({
+      terminal: {
+        id: terminalId,
+        projectId: this.projectId,
+        taskId: this.workspaceId,
+        shellId: 'system',
+        name: script.type,
+      },
+      command: script.script,
+      shellSetup: script.shellSetup,
+      initialSize,
+      respawnOnExit: false,
+      preserveBufferOnExit: true,
+      watchDevServer: script.type === 'run',
+    });
+  }
+
   async runLifecycleScript(
     script: LifecycleScript,
     options: {
       waitForExit?: boolean;
       exit?: boolean;
       respawnAfterExit?: boolean;
+      spawnAsCommand?: boolean;
       initialSize?: { cols: number; rows: number };
     } = {}
   ): Promise<LifecycleScriptExecutionResult> {
@@ -142,13 +168,18 @@ export class LifecycleScriptService implements IDisposable {
       waitForExit = false,
       exit = false,
       respawnAfterExit = false,
+      spawnAsCommand = false,
       initialSize = { cols: DEFAULT_COLS, rows: DEFAULT_ROWS },
     } = options;
 
     const { sessionId } = this.resolveIds(script);
 
     if (!ptySessionRegistry.get(sessionId)) {
-      await this.prepareLifecycleScript(script, { initialSize });
+      if (spawnAsCommand) {
+        await this.spawnLifecycleScriptCommand(script, { initialSize });
+      } else {
+        await this.prepareLifecycleScript(script, { initialSize });
+      }
     }
 
     const pty = ptySessionRegistry.get(sessionId);
@@ -180,8 +211,10 @@ export class LifecycleScriptService implements IDisposable {
           })
         : null;
 
-      const command = exit ? `${script.script}; exit` : script.script;
-      pty.write(`${command}\n`);
+      if (!spawnAsCommand) {
+        const command = exit ? `${script.script}; exit` : script.script;
+        pty.write(`${command}\n`);
+      }
 
       if (!exitPromise) {
         return { kind: 'started' };

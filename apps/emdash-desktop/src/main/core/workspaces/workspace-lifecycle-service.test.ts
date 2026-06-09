@@ -180,6 +180,36 @@ describe('WorkspaceLifecycleService', () => {
     expect(spawned).toHaveLength(1);
   });
 
+  it('can launch an awaited lifecycle script as the spawned shell command', async () => {
+    const { provider, spawned, requests } = makeTerminalProvider();
+    const service = new LifecycleScriptService({
+      projectId: 'project-command',
+      workspaceId: 'branch:feature',
+      terminals: provider,
+    });
+
+    const runPromise = service.runLifecycleScript(
+      { type: 'setup', script: 'pnpm install', shellSetup: 'source .envrc' },
+      { waitForExit: true, spawnAsCommand: true }
+    );
+
+    await expect.poll(() => requests[0]?.command).toBe('pnpm install');
+
+    expect(requests[0].terminal.id).toBe(createLifecycleScriptTerminalId('setup'));
+    expect(requests[0].shellSetup).toBe('source .envrc');
+    expect(spawned[0].writes).toEqual([]);
+
+    spawned[0].emitData('installed\n');
+    spawned[0].emitExit({ exitCode: 0 });
+
+    await expect(runPromise).resolves.toEqual({
+      kind: 'exited',
+      exitCode: 0,
+      signal: undefined,
+      outputTail: 'installed\n',
+    });
+  });
+
   it('does not attach another awaited execution to a PTY that is already running', async () => {
     const { provider, spawned } = makeTerminalProvider();
     const service = new LifecycleScriptService({

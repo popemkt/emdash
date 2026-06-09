@@ -16,6 +16,7 @@ export type LifecycleScriptPolicy = {
   exit?: boolean;
   waitForExit?: boolean;
   respawnAfterExit?: boolean;
+  spawnAsCommand?: boolean;
   timeoutMs?: number;
   logFailure: boolean;
   surfaceFailure: boolean;
@@ -152,6 +153,7 @@ export async function runLifecycleScriptWithPolicy({
         exit: policy.exit ?? true,
         waitForExit: policy.waitForExit ?? true,
         respawnAfterExit: policy.respawnAfterExit ?? false,
+        ...(policy.spawnAsCommand ? { spawnAsCommand: true } : {}),
       }
     );
     result =

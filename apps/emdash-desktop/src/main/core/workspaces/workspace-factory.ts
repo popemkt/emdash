@@ -195,6 +195,7 @@ export function createWorkspaceFactory(
               origin: 'auto-setup',
               policy: {
                 respawnAfterExit: true,
+                spawnAsCommand: true,
                 logFailure: true,
                 surfaceFailure: true,
                 continueOnFailure: true,
