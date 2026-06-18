@@ -10,14 +10,77 @@ const sqlFiles = import.meta.glob('@root/drizzle/*.sql', {
   eager: true,
 }) as Record<string, string>;
 
-type JournalEntry = { idx: number; when: number; tag: string; breakpoints: boolean };
+type JournalEntry = {
+  idx: number;
+  when: number;
+  tag: string;
+  breakpoints: boolean;
+};
 
 function isDuplicateColumnMigrationError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return /duplicate column name:/i.test(error.message);
 }
 
-function runBundledMigrations(connection: BetterSqlite3.Database): void {
+function migrationHashExists(connection: BetterSqlite3.Database, hash: string): boolean {
+  const row = connection
+    .prepare('SELECT 1 FROM __drizzle_migrations WHERE hash = ? LIMIT 1')
+    .get(hash) as { 1: number } | undefined;
+  return !!row;
+}
+
+function migrationTimestampExists(connection: BetterSqlite3.Database, createdAt: number): boolean {
+  const row = connection
+    .prepare('SELECT 1 FROM __drizzle_migrations WHERE created_at = ? LIMIT 1')
+    .get(createdAt) as { 1: number } | undefined;
+  return !!row;
+}
+
+function recordMigration(
+  connection: BetterSqlite3.Database,
+  hash: string,
+  createdAt: number
+): void {
+  connection
+    .prepare('INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)')
+    .run(hash, createdAt);
+}
+
+function hasColumn(
+  connection: BetterSqlite3.Database,
+  tableName: string,
+  columnName: string
+): boolean {
+  const columns = connection.prepare(`PRAGMA table_info(\`${tableName}\`)`).all() as Array<{
+    name: string;
+  }>;
+  return columns.some((column) => column.name === columnName);
+}
+
+function isAlreadyAppliedAddColumnStatement(
+  connection: BetterSqlite3.Database,
+  statement: string
+): boolean {
+  const match =
+    /^ALTER TABLE\s+[`"]?([A-Za-z0-9_]+)[`"]?\s+ADD\s+[`"]?([A-Za-z0-9_]+)[`"]?\s+/i.exec(
+      statement
+    );
+  if (!match) return false;
+
+  const [, tableName, columnName] = match;
+  return hasColumn(connection, tableName, columnName);
+}
+
+export function runBundledMigrations(
+  connection: BetterSqlite3.Database,
+  options: {
+    journalEntries?: JournalEntry[];
+    bundledSqlFiles?: Record<string, string>;
+  } = {}
+): void {
+  const journalEntries = options.journalEntries ?? (journal as { entries: JournalEntry[] }).entries;
+  const bundledSqlFiles = options.bundledSqlFiles ?? sqlFiles;
+
   connection.exec(`
     CREATE TABLE IF NOT EXISTS __drizzle_migrations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,18 +95,29 @@ function runBundledMigrations(connection: BetterSqlite3.Database): void {
   const lastTimestamp = lastRow?.created_at ?? 0;
 
   connection.transaction(() => {
-    for (const entry of (journal as { entries: JournalEntry[] }).entries) {
+    for (const entry of journalEntries) {
       if (entry.when <= lastTimestamp) continue;
 
-      const sqlKey = Object.keys(sqlFiles).find((k) => k.includes(entry.tag));
+      const sqlKey = Object.keys(bundledSqlFiles).find((k) => k.includes(entry.tag));
       if (!sqlKey) throw new Error(`Missing bundled SQL for migration: ${entry.tag}`);
 
-      const sql = sqlFiles[sqlKey];
+      const sql = bundledSqlFiles[sqlKey];
       const hash = createHash('sha256').update(sql).digest('hex');
+
+      // Older builds could apply the schema change but record a non-journal
+      // timestamp. When that happens, treat the migration as already applied
+      // and backfill the canonical journal row to keep startup monotonic.
+      if (migrationHashExists(connection, hash)) {
+        if (!migrationTimestampExists(connection, entry.when)) {
+          recordMigration(connection, hash, entry.when);
+        }
+        continue;
+      }
 
       for (const stmt of sql.split('--> statement-breakpoint')) {
         const trimmed = stmt.trim();
         if (!trimmed) continue;
+        if (isAlreadyAppliedAddColumnStatement(connection, trimmed)) continue;
         try {
           connection.exec(trimmed);
         } catch (error) {
@@ -52,9 +126,7 @@ function runBundledMigrations(connection: BetterSqlite3.Database): void {
         }
       }
 
-      connection
-        .prepare('INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)')
-        .run(hash, entry.when);
+      recordMigration(connection, hash, entry.when);
     }
   })();
 }
